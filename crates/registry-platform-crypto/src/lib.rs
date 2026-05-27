@@ -4,6 +4,7 @@
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
+use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
@@ -361,31 +362,10 @@ pub fn canonicalize_json(value: &Value) -> Result<Vec<u8>, JcsError> {
 
 #[must_use]
 pub fn hmac_sha256_base64url_no_pad(key: &[u8], input: &[u8]) -> String {
-    const HMAC_BLOCK_BYTES: usize = 64;
-
-    let mut normalized_key = [0_u8; HMAC_BLOCK_BYTES];
-    if key.len() > HMAC_BLOCK_BYTES {
-        normalized_key[..32].copy_from_slice(&Sha256::digest(key));
-    } else {
-        normalized_key[..key.len()].copy_from_slice(key);
-    }
-
-    let mut inner_pad = [0x36_u8; HMAC_BLOCK_BYTES];
-    let mut outer_pad = [0x5c_u8; HMAC_BLOCK_BYTES];
-    for index in 0..HMAC_BLOCK_BYTES {
-        inner_pad[index] ^= normalized_key[index];
-        outer_pad[index] ^= normalized_key[index];
-    }
-
-    let mut inner = Sha256::new();
-    inner.update(inner_pad);
-    inner.update(input);
-    let inner_hash = inner.finalize();
-
-    let mut outer = Sha256::new();
-    outer.update(outer_pad);
-    outer.update(inner_hash);
-    URL_SAFE_NO_PAD.encode(outer.finalize())
+    let mut mac =
+        Hmac::<Sha256>::new_from_slice(key).expect("HMAC-SHA256 accepts keys of any length");
+    mac.update(input);
+    URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
 }
 
 pub fn pairwise_subject_ref_hash(
