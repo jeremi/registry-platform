@@ -1,25 +1,29 @@
 use axum::body::{to_bytes, Body};
 use axum::http::{header, Method, Request, StatusCode};
+use axum::response::IntoResponse;
 use axum::routing::post;
 use axum::Router;
 use registry_platform_httpsec::{body_limit_problem_response, request_body_limit, CorsPolicy};
 use tower::ServiceExt;
 
-/// P4 baseline: a router mounted with the standard 1 MiB limit must reject
-/// a body of 1 MiB + 1 byte with PAYLOAD_TOO_LARGE, and `body_limit_problem_response`
-/// must produce the full RFC 7807 shape (type, title, status, detail).
+/// F-P4-1: a router wired with the 1 MiB limit and `body_limit_problem_response`
+/// as the error handler must reject a body of 1 MiB + 1 byte with a fully-formed
+/// RFC 7807 Problem response: status 413, Content-Type application/problem+json,
+/// and the expected type/title/status/detail fields.
 ///
-/// `RequestBodyLimitLayer` limits the body stream; the 413 is produced by the
-/// handler when it reads past the cap, so the test handler explicitly reads the body.
+/// `RequestBodyLimitLayer` wraps the body stream; when the handler reads past
+/// the cap the stream returns an error, which the handler converts into the
+/// Problem response via `body_limit_problem_response`. This exercises the
+/// intended wiring pattern.
 #[tokio::test]
-async fn body_limit_baseline_rejects_oversized_body_and_problem_response_has_full_shape() {
+async fn body_limit_wired_with_problem_response_returns_rfc7807_on_oversized_body() {
     let app = Router::new()
         .route(
             "/",
             post(|body: Body| async move {
                 match to_bytes(body, usize::MAX).await {
-                    Ok(_) => StatusCode::OK,
-                    Err(_) => StatusCode::PAYLOAD_TOO_LARGE,
+                    Ok(_) => StatusCode::OK.into_response(),
+                    Err(_) => body_limit_problem_response(Request::new(Body::empty())).await,
                 }
             }),
         )
@@ -36,11 +40,14 @@ async fn body_limit_baseline_rejects_oversized_body_and_problem_response_has_ful
         )
         .await
         .expect("app responds");
-    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
 
-    let problem = body_limit_problem_response(Request::new(Body::empty())).await;
-    assert_eq!(problem.status(), StatusCode::PAYLOAD_TOO_LARGE);
-    let bytes = to_bytes(problem.into_body(), 4096)
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(
+        response.headers().get("content-type").unwrap(),
+        "application/problem+json",
+        "oversized body must receive an application/problem+json response"
+    );
+    let bytes = to_bytes(response.into_body(), 4096)
         .await
         .expect("problem body reads");
     let body: serde_json::Value = serde_json::from_slice(&bytes).expect("problem body is JSON");
