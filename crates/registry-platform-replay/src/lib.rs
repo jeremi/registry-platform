@@ -5,14 +5,12 @@ use std::{
     collections::HashMap,
     error::Error as StdError,
     fmt,
-    hash::{Hash, Hasher},
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 use async_trait::async_trait;
 use thiserror::Error;
 use time::OffsetDateTime;
-use tokio::sync::Mutex;
 
 /// A structured namespace for replay identifiers.
 ///
@@ -207,19 +205,55 @@ impl InMemoryReplayStore {
         Self::default()
     }
 
-    pub async fn len(&self) -> usize {
-        self.records.lock().await.len()
+    pub fn len(&self) -> usize {
+        self.records
+            .lock()
+            .expect("in-memory replay store lock is healthy")
+            .len()
     }
 
-    pub async fn is_empty(&self) -> bool {
-        self.records.lock().await.is_empty()
+    pub fn is_empty(&self) -> bool {
+        self.records
+            .lock()
+            .expect("in-memory replay store lock is healthy")
+            .is_empty()
     }
 
-    pub async fn purge_expired(&self, now: OffsetDateTime) -> usize {
-        let mut records = self.records.lock().await;
+    pub fn purge_expired(&self, now: OffsetDateTime) -> usize {
+        let mut records = self
+            .records
+            .lock()
+            .expect("in-memory replay store lock is healthy");
         let before = records.len();
         records.retain(|_, expires_at| *expires_at > now);
         before - records.len()
+    }
+
+    fn insert_once_sync(
+        &self,
+        scope: &ReplayScope,
+        key: &ReplayKey,
+        expires_at: OffsetDateTime,
+    ) -> Result<ReplayInsertOutcome, ReplayStoreError> {
+        let now = OffsetDateTime::now_utc();
+        if expires_at <= now {
+            return Err(ReplayStoreError::ExpiredRecord { expires_at });
+        }
+
+        let mut records = self
+            .records
+            .lock()
+            .expect("in-memory replay store lock is healthy");
+        let stored_key = StoredReplayKey::new(scope, key);
+        match records.get_mut(&stored_key) {
+            Some(existing_expires_at) if *existing_expires_at > now => {
+                Ok(ReplayInsertOutcome::AlreadySeen)
+            }
+            _ => {
+                records.insert(stored_key, expires_at);
+                Ok(ReplayInsertOutcome::Inserted)
+            }
+        }
     }
 }
 
@@ -231,28 +265,7 @@ impl ReplayStore for InMemoryReplayStore {
         key: &ReplayKey,
         expires_at: OffsetDateTime,
     ) -> Result<ReplayInsertOutcome, ReplayStoreError> {
-        let now = OffsetDateTime::now_utc();
-        if expires_at <= now {
-            return Err(ReplayStoreError::ExpiredRecord { expires_at });
-        }
-
-        let mut records = self.records.lock().await;
-        records.retain(|_, existing_expires_at| *existing_expires_at > now);
-
-        let stored_key = StoredReplayKey::new(scope, key);
-        match records.get_mut(&stored_key) {
-            Some(existing_expires_at) if *existing_expires_at > now => {
-                Ok(ReplayInsertOutcome::AlreadySeen)
-            }
-            Some(existing_expires_at) => {
-                *existing_expires_at = expires_at;
-                Ok(ReplayInsertOutcome::Inserted)
-            }
-            None => {
-                records.insert(stored_key, expires_at);
-                Ok(ReplayInsertOutcome::Inserted)
-            }
-        }
+        self.insert_once_sync(scope, key, expires_at)
     }
 }
 
@@ -310,7 +323,7 @@ pub enum RequiredReplayError {
     },
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 struct StoredReplayKey {
     scope: ReplayScope,
     key: ReplayKey,
@@ -322,13 +335,6 @@ impl StoredReplayKey {
             scope: scope.clone(),
             key: key.clone(),
         }
-    }
-}
-
-impl Hash for StoredReplayKey {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.scope.hash(state);
-        self.key.hash(state);
     }
 }
 
@@ -440,6 +446,31 @@ mod tests {
             store.insert_once(&scope, &key, future()).await.unwrap(),
             ReplayInsertOutcome::Inserted
         );
+    }
+
+    #[tokio::test]
+    async fn expired_records_can_be_purged_without_insert_scan() {
+        let store = InMemoryReplayStore::new();
+        let first_scope = scope("openid4vci");
+        let second_scope = scope("federation");
+        let first_key = key("nonce-1");
+        let second_key = key("nonce-2");
+
+        let now = OffsetDateTime::now_utc();
+        store
+            .insert_once(&first_scope, &first_key, now + Duration::from_millis(10))
+            .await
+            .expect("first insert succeeds");
+        store
+            .insert_once(&second_scope, &second_key, now + Duration::from_secs(60))
+            .await
+            .expect("second insert succeeds");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        assert_eq!(store.len(), 2);
+        assert_eq!(store.purge_expired(OffsetDateTime::now_utc()), 1);
+        assert_eq!(store.len(), 1);
+        assert!(!store.is_empty());
     }
 
     #[tokio::test]

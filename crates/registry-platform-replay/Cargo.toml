@@ -11,5 +11,6 @@ publish = false
 async-trait.workspace = true
 thiserror.workspace = true
 time.workspace = true
-tokio.workspace = true
 
+[dev-dependencies]
+tokio.workspace = true
