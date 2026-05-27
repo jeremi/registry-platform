@@ -7,6 +7,38 @@ Scope: pre-release review of the 9-crate workspace.
 > - **Distribution model for 0.1.x: git tag.** The crates.io publish decision is deferred to 0.2 once the API has settled. Several P0s in §6 only matter if publishing (Cargo metadata, path-dep versions, crate naming, workspace-vs-per-crate versioning); they are deferred accordingly.
 > - **The authoritative ship-blocker list for 0.1.3 is §8.4 (staff-engineer re-prioritization), not §6.** §6 is preserved for traceability of the lane-by-lane findings.
 
+> **Mechanical fixes executed (2026-05-27) — PR #8:**
+>
+> A follow-up session executed all 15 in-scope mechanical items from §8.3. Implementation was TDD (failing test first, then fix). A staff-engineer Opus review ran post-implementation and found one P2 (see below); the fix is included in the same PR.
+>
+> | Item | Status | Notes |
+> |------|--------|-------|
+> | F-P10-1 | Closed | `getrandom` hoisted to `[workspace.dependencies]` |
+> | F-testing-1 | Closed | Sibling path-dep versions aligned to `"0.1.2"` |
+> | F-crypto-2 | Closed | Unused `jsonwebtoken` removed from `crypto/Cargo.toml` |
+> | F-oid4vci-4 | Closed | `oid4vci/README.md` created |
+> | F-P2-1 | Closed | `AuditHashSecret` Debug redaction regression test |
+> | F-P2-2 | Closed | `SdJwtIssuer` Debug redaction regression test |
+> | F-P3-1 | Closed | Ed25519 seed wrapped in `Zeroizing<[u8; 32]>` |
+> | F-P4-1 | Closed | Integration test wires `body_limit_problem_response` end-to-end (see P2 below) |
+> | F-P6-1 | Closed | `jwks_uri_override` doc comment with security warning |
+> | F-P8-1 | Closed | `sign`/`verify` doc comments + `#[ignore]` micro-benchmarks |
+> | F-crypto-3 | Closed | Unit tests for all three `DidError` variants |
+> | F-httpsec-2 | Closed | Integration test: non-allowlisted Origin gets no ACAO |
+> | F-httpsec-3 | Closed | Problem JSON serialisation shape test |
+> | F-oid4vci-1 | Closed | `PKCE_METHOD_S256` constant removed |
+> | F-oid4vci-2 | Closed | Nonce-replay contract documented and tested |
+> | F-oid4vci-3 | Closed | Serialisation round-trip tests for `CredentialConfigurationMetadata` and `CredentialOffer` |
+> | F-sdjwt-2 | Closed | Malformed compact JWT rejection test |
+> | F-testing-2 | Closed | `testing/README.md` rewritten to cover all public items |
+> | F-P1-1 | Deferred | Not in scope for this pass |
+> | F-crypto-1 | Deferred | Not in scope for this pass |
+> | F-httputil-1 | Deferred | Not in scope for this pass |
+> | F-sdjwt-1 | Deferred | Not in scope for this pass |
+> | F-httpsec-6 | Deferred | Not in scope for this pass |
+>
+> **Staff-engineer post-implementation review (Opus, 2026-05-27):** One P2 was found. The original F-P4-1 tests checked the 413 status and the RFC 7807 Problem JSON shape in isolation: the layer rejected the body and the helper produced the JSON, but they were never connected in a single request path. Fixed: both integration tests (`httpsec/tests/integration.rs` and `testing/tests/cross_crate_integration.rs`) now wire `body_limit_problem_response` in the handler error branch and assert the full end-to-end response (status, `Content-Type: application/problem+json`, type/title/status/detail) from a single oversized request. All other items were cleared with no findings.
+
 Five expert subagents reviewed independently:
 
 1. **Security & cryptography** (opus)
