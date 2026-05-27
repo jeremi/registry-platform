@@ -399,10 +399,16 @@ pub fn pairwise_subject_ref_hash(
 /// re-measure on your hardware.
 pub fn sign(payload: &[u8], jwk: &PrivateJwk) -> Result<Vec<u8>, CryptoError> {
     jwk.validate_private()?;
-    let seed_vec: Zeroizing<Vec<u8>> = Zeroizing::new(decode_fixed(jwk.d.as_deref(), 32, "d")?);
-    let seed: Zeroizing<[u8; 32]> = Zeroizing::new(
-        <[u8; 32]>::try_from(seed_vec.as_slice()).map_err(|_| JwkError::Invalid("d length"))?,
-    );
+    // Decode directly into a stack-allocated Zeroizing buffer to avoid any
+    // intermediate heap allocation that would not be zeroed on error paths.
+    let d_str = jwk.d.as_deref().ok_or(JwkError::Invalid("d"))?;
+    let mut seed = Zeroizing::new([0u8; 32]);
+    let decoded_len = URL_SAFE_NO_PAD
+        .decode_slice(d_str, &mut *seed)
+        .map_err(|_| JwkError::Invalid("d"))?;
+    if decoded_len != 32 {
+        return Err(JwkError::Invalid("d length").into());
+    }
     let signature = SigningKey::from_bytes(&seed).sign(payload);
     Ok(signature.to_bytes().to_vec())
 }
