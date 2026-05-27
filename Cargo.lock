@@ -1567,6 +1567,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "registry-platform-replay"
+version = "0.1.2"
+dependencies = [
+ "async-trait",
+ "thiserror",
+ "time",
+ "tokio",
+]
+
+[[package]]
 name = "registry-platform-sdjwt"
 version = "0.1.2"
 dependencies = [
@@ -1598,9 +1608,12 @@ dependencies = [
  "registry-platform-httputil",
  "registry-platform-oid4vci",
  "registry-platform-oidc",
+ "registry-platform-replay",
  "reqwest",
  "serde_json",
  "tempfile",
+ "thiserror",
+ "time",
  "tokio",
  "tower",
  "wiremock",
