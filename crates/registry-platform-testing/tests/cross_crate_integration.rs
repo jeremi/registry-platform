@@ -157,4 +157,10 @@ async fn sample_axum_app_wires_middleware_oidc_and_audit_chain() {
         .expect("problem body reads");
     let value: serde_json::Value = serde_json::from_slice(&body).expect("problem body is json");
     assert_eq!(value["status"], 413);
+    assert_eq!(
+        value["type"],
+        "https://registry-platform.dev/problems/request/body-too-large"
+    );
+    assert_eq!(value["title"], "Payload Too Large");
+    assert_eq!(value["detail"], "request body exceeds the configured limit");
 }
