@@ -112,7 +112,7 @@ pub struct LocalJwkSigner {
 impl LocalJwkSigner {
     /// Build a local signer from an Ed25519 private JWK with a non-empty `kid`.
     pub fn new(jwk: PrivateJwk) -> Result<Self, SigningError> {
-        jwk.algorithm().map_err(SigningError::InvalidKey)?;
+        jwk.validate_private().map_err(SigningError::InvalidKey)?;
         let key_id = jwk
             .kid
             .as_deref()
@@ -296,13 +296,12 @@ impl SigningError {
     #[must_use]
     pub fn external(message: impl AsRef<str>) -> Self {
         const MAX_SAFE_CHARS: usize = 160;
-        let sanitized = message
+        let mut chars = message
             .as_ref()
             .chars()
-            .map(|ch| if ch.is_control() { ' ' } else { ch })
-            .collect::<String>();
-        let mut bounded = sanitized.chars().take(MAX_SAFE_CHARS).collect::<String>();
-        if sanitized.chars().count() > MAX_SAFE_CHARS {
+            .map(|ch| if ch.is_control() { ' ' } else { ch });
+        let mut bounded = chars.by_ref().take(MAX_SAFE_CHARS).collect::<String>();
+        if chars.next().is_some() {
             bounded.push_str("...");
         }
         Self::External { message: bounded }
@@ -775,6 +774,17 @@ mod tests {
         assert!(matches!(
             LocalJwkSigner::new(private),
             Err(SigningError::MissingKeyId)
+        ));
+    }
+
+    #[test]
+    fn local_jwk_signer_validates_private_material_at_construction() {
+        let mut private = PrivateJwk::parse(RAW_JWK).expect("private jwk parses");
+        private.d = Some("not-base64url".to_string());
+
+        assert!(matches!(
+            LocalJwkSigner::new(private),
+            Err(SigningError::InvalidKey(JwkError::Invalid("d")))
         ));
     }
 
