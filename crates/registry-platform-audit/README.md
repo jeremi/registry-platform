@@ -32,7 +32,7 @@ async fn write_audit_event() -> Result<(), registry_platform_audit::AuditError> 
     let envelope = chain
         .append(&sink, json!({
             "event": "credential.issued",
-            "subject_ref": profile.key_hasher().hash("subject", "did:example:123"),
+            "subject_ref": profile.key_hasher().hash("did:example:123"),
         }))
         .await?;
 
