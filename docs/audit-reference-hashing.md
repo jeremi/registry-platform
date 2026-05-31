@@ -27,6 +27,15 @@ The primitive domain-separates audit reference hashes from raw
 `AuditKeyHasher::hash` output and from audit-chain record hashes. Changing class,
 scope, or canonical input changes the output.
 
+The framed input to the platform hasher is:
+
+```text
+registry-platform:audit-reference:v1 || "\0" || len(class) || "\0" || class || "\0" || len(scope) || "\0" || scope || "\0" || len(canonical_input) || "\0" || canonical_input
+```
+
+`class` and `canonical_input` must be non-empty. `scope` may be empty, but the
+empty value is still length-framed.
+
 ## Service Responsibilities
 
 Services remain responsible for:
