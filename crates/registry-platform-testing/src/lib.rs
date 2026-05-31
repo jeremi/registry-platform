@@ -547,7 +547,7 @@ where
 fn json_value_contains(value: &Value, needle: &str) -> bool {
     match value {
         Value::Null => false,
-        Value::Bool(value) => value.to_string().contains(needle),
+        Value::Bool(value) => (if *value { "true" } else { "false" }).contains(needle),
         Value::Number(value) => value.to_string().contains(needle),
         Value::String(value) => value.contains(needle),
         Value::Array(values) => values
@@ -863,6 +863,13 @@ mod tests {
         let err = assert_json_absent_strings(&escaped, ["subject \"quoted\""])
             .expect_err("escaped string-value leak is reported");
         assert_eq!(err.needle(), "subject \"quoted\"");
+
+        let boolean = json!({
+            "contains_bool": true,
+        });
+        let err =
+            assert_json_absent_strings(&boolean, ["true"]).expect_err("boolean leak is reported");
+        assert_eq!(err.needle(), "true");
     }
 
     #[tokio::test]
