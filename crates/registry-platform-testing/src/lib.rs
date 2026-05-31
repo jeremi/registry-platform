@@ -533,16 +533,30 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
 {
-    let rendered = value.to_string();
     for needle in forbidden {
         let needle = needle.as_ref();
-        if !needle.is_empty() && rendered.contains(needle) {
+        if !needle.is_empty() && json_value_contains(value, needle) {
             return Err(AuditJsonLeakError {
                 needle: needle.to_string(),
             });
         }
     }
     Ok(())
+}
+
+fn json_value_contains(value: &Value, needle: &str) -> bool {
+    match value {
+        Value::Null => false,
+        Value::Bool(value) => value.to_string().contains(needle),
+        Value::Number(value) => value.to_string().contains(needle),
+        Value::String(value) => value.contains(needle),
+        Value::Array(values) => values
+            .iter()
+            .any(|value| json_value_contains(value, needle)),
+        Value::Object(map) => map
+            .iter()
+            .any(|(key, value)| key.contains(needle) || json_value_contains(value, needle)),
+    }
 }
 
 #[derive(Debug, Error)]
@@ -838,6 +852,17 @@ mod tests {
         let err = assert_json_absent_strings(&record, ["raw subject"])
             .expect_err("raw substring is reported");
         assert_eq!(err.needle(), "raw subject");
+
+        let escaped = json!({
+            "A\nB": "safe wrapper",
+            "nested": { "value": "subject \"quoted\" value" },
+        });
+        let err = assert_json_absent_strings(&escaped, ["A\nB"])
+            .expect_err("escaped object-key leak is reported");
+        assert_eq!(err.needle(), "A\nB");
+        let err = assert_json_absent_strings(&escaped, ["subject \"quoted\""])
+            .expect_err("escaped string-value leak is reported");
+        assert_eq!(err.needle(), "subject \"quoted\"");
     }
 
     #[tokio::test]
