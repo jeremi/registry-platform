@@ -119,8 +119,14 @@ pub struct ProofTypeMetadata {
     pub proof_signing_alg_values_supported: Vec<String>,
 }
 
-fn default_tx_code_input_mode() -> String {
-    "numeric".to_string()
+/// Expected character set of a transaction code, per OID4VCI: `numeric` (digits
+/// only, the default) or `text` (any characters).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TxCodeInputMode {
+    #[default]
+    Numeric,
+    Text,
 }
 
 /// Transaction code parameters carried inside a pre-authorized-code grant.
@@ -130,8 +136,8 @@ fn default_tx_code_input_mode() -> String {
 /// and `description` is optional guidance shown to the holder.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TxCode {
-    #[serde(default = "default_tx_code_input_mode")]
-    pub input_mode: String,
+    #[serde(default)]
+    pub input_mode: TxCodeInputMode,
     pub length: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
@@ -140,7 +146,7 @@ pub struct TxCode {
 impl TxCode {
     pub fn new(length: u64, description: Option<String>) -> Self {
         Self {
-            input_mode: default_tx_code_input_mode(),
+            input_mode: TxCodeInputMode::Numeric,
             length,
             description,
         }
@@ -1041,7 +1047,7 @@ mod tests {
 
         let from_minimal: TxCode =
             serde_json::from_value(json!({"length": 8})).expect("deserializes minimal tx_code");
-        assert_eq!(from_minimal.input_mode, "numeric");
+        assert_eq!(from_minimal.input_mode, TxCodeInputMode::Numeric);
         assert_eq!(from_minimal.length, 8);
         assert_eq!(from_minimal.description, None);
     }
