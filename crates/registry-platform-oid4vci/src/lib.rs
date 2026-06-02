@@ -257,8 +257,12 @@ pub struct CredentialResponse {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenRequest {
     pub grant_type: String,
-    #[serde(rename = "pre-authorized_code")]
-    pub pre_authorized_code: String,
+    #[serde(
+        rename = "pre-authorized_code",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub pre_authorized_code: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tx_code: Option<String>,
 }
@@ -267,8 +271,10 @@ pub struct TokenRequest {
 pub struct TokenResponse {
     pub access_token: String,
     pub token_type: String,
-    pub expires_in: u64,
-    pub c_nonce: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_in: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub c_nonce: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub c_nonce_expires_in: Option<u64>,
 }
@@ -1048,7 +1054,10 @@ mod tests {
             serde_urlencoded::from_str(form).expect("form decodes into TokenRequest");
 
         assert_eq!(request.grant_type, PRE_AUTHORIZED_CODE_GRANT_TYPE);
-        assert_eq!(request.pre_authorized_code, "pre-auth-code-123");
+        assert_eq!(
+            request.pre_authorized_code.as_deref(),
+            Some("pre-auth-code-123")
+        );
         assert_eq!(request.tx_code.as_deref(), Some("123456"));
 
         let request: TokenRequest = serde_json::from_value(json!({
@@ -1056,7 +1065,10 @@ mod tests {
             "pre-authorized_code": "pre-auth-code-123"
         }))
         .expect("json decodes into TokenRequest");
-        assert_eq!(request.pre_authorized_code, "pre-auth-code-123");
+        assert_eq!(
+            request.pre_authorized_code.as_deref(),
+            Some("pre-auth-code-123")
+        );
         assert_eq!(request.tx_code, None);
     }
 
@@ -1065,8 +1077,8 @@ mod tests {
         let response = TokenResponse {
             access_token: "access-token-abc".to_string(),
             token_type: "Bearer".to_string(),
-            expires_in: 300,
-            c_nonce: "c-nonce-xyz".to_string(),
+            expires_in: Some(300),
+            c_nonce: Some("c-nonce-xyz".to_string()),
             c_nonce_expires_in: Some(120),
         };
         let value = serde_json::to_value(&response).expect("serializes");
@@ -1080,7 +1092,7 @@ mod tests {
         let round_tripped: TokenResponse =
             serde_json::from_value(value).expect("round-trip deserializes");
         assert_eq!(round_tripped.access_token, "access-token-abc");
-        assert_eq!(round_tripped.c_nonce, "c-nonce-xyz");
+        assert_eq!(round_tripped.c_nonce.as_deref(), Some("c-nonce-xyz"));
     }
 
     #[test]
@@ -1088,8 +1100,8 @@ mod tests {
         let response = TokenResponse {
             access_token: "access-token-abc".to_string(),
             token_type: "Bearer".to_string(),
-            expires_in: 300,
-            c_nonce: "c-nonce-xyz".to_string(),
+            expires_in: Some(300),
+            c_nonce: Some("c-nonce-xyz".to_string()),
             c_nonce_expires_in: None,
         };
         let value = serde_json::to_value(&response).expect("serializes");
