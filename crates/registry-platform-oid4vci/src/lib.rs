@@ -258,10 +258,10 @@ pub struct CredentialResponse {
 pub struct TokenRequest {
     pub grant_type: String,
     #[serde(
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TokenRequest {
-    pub grant_type: String,
-    #[serde(rename = "pre-authorized_code", default, skip_serializing_if = "Option::is_none")]
+        rename = "pre-authorized_code",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub pre_authorized_code: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tx_code: Option<String>,
