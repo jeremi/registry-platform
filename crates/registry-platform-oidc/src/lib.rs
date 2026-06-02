@@ -775,7 +775,7 @@ impl TokenVerifier {
         if !self.config.allowed_algorithms.contains(&header.alg) {
             return Err(OidcError::AlgorithmNotAllowed);
         }
-        enforce_typ(header.typ.as_deref(), &self.allowed_id_typ)?;
+        enforce_optional_typ(header.typ.as_deref(), &self.allowed_id_typ)?;
         let kid = header.kid.ok_or(OidcError::MissingKid)?;
         let key = self
             .fetcher
@@ -830,7 +830,7 @@ impl TokenVerifier {
         if !self.config.allowed_algorithms.contains(&header.alg) {
             return Err(OidcError::AlgorithmNotAllowed);
         }
-        enforce_typ(header.typ.as_deref(), &self.allowed_userinfo_typ)?;
+        enforce_optional_typ(header.typ.as_deref(), &self.allowed_userinfo_typ)?;
         let kid = header.kid.ok_or(OidcError::MissingKid)?;
         let key = self
             .fetcher
@@ -1024,6 +1024,22 @@ fn enforce_typ(typ: Option<&str>, allowed: &HashSet<String>) -> Result<(), OidcE
         Ok(())
     } else {
         Err(OidcError::TokenTypeNotAllowed)
+    }
+}
+
+/// Like [`enforce_typ`], but a MISSING `typ` header is accepted. The `typ`
+/// header is OPTIONAL for ID Tokens and signed UserInfo responses (OpenID
+/// Connect Core 1.0), and providers such as eSignet omit it. A present `typ`
+/// must still be in the allow-list, and an empty allow-list still denies the
+/// token type entirely (used to forbid a token class outright).
+fn enforce_optional_typ(typ: Option<&str>, allowed: &HashSet<String>) -> Result<(), OidcError> {
+    if allowed.is_empty() {
+        return Err(OidcError::TokenTypeNotAllowed);
+    }
+    match typ {
+        None => Ok(()),
+        Some(typ) if allowed.contains(&typ.to_ascii_lowercase()) => Ok(()),
+        Some(_) => Err(OidcError::TokenTypeNotAllowed),
     }
 }
 
@@ -1685,6 +1701,9 @@ mod tests {
             .await
             .expect("valid signed UserInfo verifies");
 
+        // A signed UserInfo response without a `typ` header verifies: the `typ`
+        // header is OPTIONAL for UserInfo JWTs (OpenID Connect Core 1.0). eSignet
+        // omits it.
         let missing_typ = signed_hs256_token(
             "kid",
             test_claims(
@@ -1695,10 +1714,31 @@ mod tests {
             secret,
             None,
         );
+        verifier
+            .verify_userinfo_jwt_with_claims_policy(
+                &missing_typ,
+                &access,
+                &accepted_issuers,
+                &accepted_audiences,
+            )
+            .await
+            .expect("UserInfo without a typ header verifies");
+
+        // A present-but-disallowed `typ` is still rejected.
+        let wrong_typ = signed_hs256_token(
+            "kid",
+            test_claims(
+                Some("https://issuer.example/userinfo"),
+                Some("citizen-client"),
+                Some("subject-1"),
+            ),
+            secret,
+            Some("at+jwt"),
+        );
         assert!(matches!(
             verifier
                 .verify_userinfo_jwt_with_claims_policy(
-                    &missing_typ,
+                    &wrong_typ,
                     &access,
                     &accepted_issuers,
                     &accepted_audiences,
@@ -1950,6 +1990,37 @@ mod tests {
             verifier.verify_related_token(&resource_audience).await,
             Err(OidcError::AudienceMismatch)
         ));
+    }
+
+    #[tokio::test]
+    async fn oidc_related_id_token_allows_missing_typ() {
+        // OpenID Connect Core 1.0 makes the ID Token `typ` header OPTIONAL;
+        // eSignet (and other IdPs) omit it. A missing `typ` must verify, while a
+        // present-but-disallowed `typ` stays rejected (asserted in the test above).
+        let secret = b"registry-platform-id-token-missing-typ-secret";
+        let verifier = hs256_test_verifier(
+            "https://issuer.example",
+            vec!["registry-api".to_string()],
+            vec!["citizen-client".to_string()],
+            "kid",
+            secret,
+        )
+        .await;
+
+        let id_token = signed_hs256_token(
+            "kid",
+            test_claims(
+                Some("https://issuer.example"),
+                Some("citizen-client"),
+                Some("subject-1"),
+            ),
+            secret,
+            None,
+        );
+        verifier
+            .verify_related_token(&id_token)
+            .await
+            .expect("ID token without a typ header verifies");
     }
 
     #[tokio::test]
