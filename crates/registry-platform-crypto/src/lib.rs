@@ -748,11 +748,19 @@ fn decode_fixed(
     Ok(decoded)
 }
 
-fn decode_nonempty(value: Option<&str>, field: &'static str) -> Result<Vec<u8>, JwkError> {
+fn decode_nonempty(
+    value: Option<&str>,
+    field: &'static str,
+) -> Result<Zeroizing<Vec<u8>>, JwkError> {
     let value = value.ok_or(JwkError::Invalid(field))?;
-    let decoded = URL_SAFE_NO_PAD
-        .decode(value)
-        .map_err(|_| JwkError::Invalid(field))?;
+    // The decoded buffer can hold private RSA components (d, p, q), so wrap it
+    // in Zeroizing to clear the bytes when the buffer drops, including on the
+    // validation paths that decode purely to check the field and discard it.
+    let decoded = Zeroizing::new(
+        URL_SAFE_NO_PAD
+            .decode(value)
+            .map_err(|_| JwkError::Invalid(field))?,
+    );
     if decoded.is_empty() {
         return Err(JwkError::Invalid(field));
     }
