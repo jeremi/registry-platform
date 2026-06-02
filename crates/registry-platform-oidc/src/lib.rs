@@ -1015,12 +1015,20 @@ fn normalize_typ_set(values: &[String]) -> HashSet<String> {
     values.iter().map(|typ| typ.to_ascii_lowercase()).collect()
 }
 
+/// Case-insensitive membership test for a JOSE `typ` header against an
+/// already-lowercased allow-list (see `normalize_typ_set`). `typ` is commonly
+/// already lowercase (`"jwt"`, `"at+jwt"`), so try a direct hit before
+/// allocating a lowercased copy for the fallback.
+fn typ_in_allow_list(typ: &str, allowed: &HashSet<String>) -> bool {
+    allowed.contains(typ) || allowed.contains(&typ.to_ascii_lowercase())
+}
+
 fn enforce_typ(typ: Option<&str>, allowed: &HashSet<String>) -> Result<(), OidcError> {
     if allowed.is_empty() {
         return Err(OidcError::TokenTypeNotAllowed);
     }
     let typ = typ.ok_or(OidcError::TokenTypeNotAllowed)?;
-    if allowed.contains(&typ.to_ascii_lowercase()) {
+    if typ_in_allow_list(typ, allowed) {
         Ok(())
     } else {
         Err(OidcError::TokenTypeNotAllowed)
@@ -1038,7 +1046,7 @@ fn enforce_optional_typ(typ: Option<&str>, allowed: &HashSet<String>) -> Result<
     }
     match typ {
         None => Ok(()),
-        Some(typ) if allowed.contains(&typ.to_ascii_lowercase()) => Ok(()),
+        Some(typ) if typ_in_allow_list(typ, allowed) => Ok(()),
         Some(_) => Err(OidcError::TokenTypeNotAllowed),
     }
 }
