@@ -2074,6 +2074,7 @@ name = "registry-platform-config"
 version = "0.1.2"
 dependencies = [
  "async-trait",
+ "aws-lc-rs",
  "bytes",
  "chrono",
  "futures-core",

@@ -1,18 +1,20 @@
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 
-use std::collections::HashMap;
-
+use aws_lc_rs::rand::SystemRandom;
 use chrono::{TimeDelta, Utc};
 use registry_platform_config::{
-    sha256_uri, ConfigVerificationError, LocalTufRepositoryInput, RemoteTufRepositoryInput,
-    TufConfigVerifier, VerificationContext,
+    sha256_uri, ConfigVerificationError, LocalTufRepositoryInput, RegistryAcceptedTrustRoots,
+    RegistryTrustRoot, RemoteTufRepositoryInput, TrustRootRole, TrustRootSigner, TufConfigVerifier,
+    VerificationContext,
 };
 use serde_json::{json, Value};
 use tempfile::TempDir;
-use tough::editor::signed::PathExists;
+use tough::editor::signed::{PathExists, SignedRole};
 use tough::editor::RepositoryEditor;
 use tough::key_source::{KeySource, LocalKeySource};
-use tough::schema::Target;
+use tough::schema::{KeyHolder, Root, Signed, Target};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -99,6 +101,18 @@ async fn mount_directory_files(server: &MockServer, url_prefix: &str, dir: &Path
     }
 }
 
+fn copy_directory_files(src: &Path, dst: &Path) {
+    std::fs::create_dir_all(dst).expect("destination directory exists");
+    for entry in std::fs::read_dir(src).expect("source directory reads") {
+        let entry = entry.expect("source directory entry reads");
+        let source_path = entry.path();
+        if !source_path.is_file() {
+            continue;
+        }
+        std::fs::copy(source_path, dst.join(entry.file_name())).expect("file copies");
+    }
+}
+
 async fn generated_repository_input(
     repo: &TempDir,
     datastore: &TempDir,
@@ -124,7 +138,7 @@ async fn generated_repository_input_with_custom(
     let expiry = Utc::now()
         .checked_add_signed(TimeDelta::try_days(30).expect("duration"))
         .expect("future expiration");
-    let version = std::num::NonZeroU64::new(version).expect("non-zero version");
+    let version = NonZeroU64::new(version).expect("non-zero version");
 
     let mut editor = RepositoryEditor::new(&root_path)
         .await
@@ -166,6 +180,64 @@ async fn generated_repository_input_with_custom(
     }
 }
 
+async fn write_rotated_root_with_same_keys(metadata_dir: &Path) -> PathBuf {
+    let data = tough_fixture_dir("");
+    let root_path = data.join("simple-rsa").join("root.json");
+    let key_path = data.join("snakeoil.pem");
+    let root_bytes = std::fs::read(&root_path).expect("root fixture reads");
+    let mut root: Signed<Root> = serde_json::from_slice(&root_bytes).expect("root fixture parses");
+    root.signed.version = NonZeroU64::new(2).expect("non-zero root version");
+    root.signed.expires = Utc::now()
+        .checked_add_signed(TimeDelta::try_days(30).expect("duration"))
+        .expect("future root expiration");
+
+    let consistent_snapshot = root.signed.consistent_snapshot;
+    let key_holder = KeyHolder::Root(root.signed.clone());
+    let keys: Vec<Box<dyn KeySource>> = vec![Box::new(LocalKeySource { path: key_path })];
+    let signed_root = SignedRole::new(root.signed, &key_holder, &keys, &SystemRandom::new())
+        .await
+        .expect("rotated root signs");
+    signed_root
+        .write(metadata_dir, consistent_snapshot)
+        .await
+        .expect("rotated root writes");
+    metadata_dir.join("2.root.json")
+}
+
+fn trust_root_for_verified_target(
+    root_id: &str,
+    tuf_root_sha256: String,
+    signer_kids: &[String],
+) -> RegistryTrustRoot {
+    let signers = signer_kids
+        .iter()
+        .map(|kid| {
+            (
+                kid.clone(),
+                TrustRootSigner {
+                    kid: kid.clone(),
+                    enabled: true,
+                },
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    RegistryTrustRoot {
+        root_id: root_id.to_string(),
+        production: false,
+        tuf_root_sha256,
+        valid_from_unix_seconds: None,
+        valid_until_unix_seconds: None,
+        high_risk_change_classes: BTreeSet::new(),
+        signers,
+        roles: vec![TrustRootRole {
+            name: "config-operator".to_string(),
+            threshold: 1,
+            signer_kids: signer_kids.to_vec(),
+            allowed_change_classes: BTreeSet::from(["root_transition".to_string()]),
+        }],
+    }
+}
+
 #[tokio::test]
 async fn verifies_local_tuf_target_without_network_and_reports_versions() {
     let base = tough_fixture_dir("tuf-reference-impl");
@@ -194,6 +266,91 @@ async fn verifies_local_tuf_target_without_network_and_reports_versions() {
         vec![TUF_REFERENCE_TARGETS_SIGNER_KID.to_string()]
     );
     assert_eq!(target.custom_metadata["file_permissions"], "0644");
+}
+
+#[tokio::test]
+async fn root_transition_target_verifies_under_two_final_tuf_roots() {
+    let repo = TempDir::new().expect("repo tempdir");
+    let old_datastore = TempDir::new().expect("old datastore tempdir");
+    let new_datastore = TempDir::new().expect("new datastore tempdir");
+    let target_name = "file4.txt";
+    let target = std::fs::read(tough_fixture_dir("").join("targets").join(target_name))
+        .expect("target fixture reads");
+    let custom = json!({
+        "product": "registry-relay",
+        "instance_id": "relay-a",
+        "environment": "production",
+        "stream_id": "default",
+        "bundle_id": "bundle-root-transition",
+        "sequence": 44,
+        "previous_config_hash": "sha256:old",
+        "config_hash": sha256_uri(&target),
+        "change_classes": ["root_transition"],
+        "signer_kids": ["metadata-only-kid"],
+        "apply_policy": "restart_required"
+    });
+    let mut old_input =
+        generated_repository_input_with_custom(&repo, &old_datastore, target_name, 1, Some(custom))
+            .await;
+    let new_metadata_dir = repo.path().join("metadata-v2");
+    copy_directory_files(&old_input.metadata_dir, &new_metadata_dir);
+    let new_root_path = write_rotated_root_with_same_keys(&new_metadata_dir).await;
+    let mut new_input = old_input.clone();
+    old_input.datastore_dir = old_datastore.path().to_path_buf();
+    new_input.root_path = new_root_path;
+    new_input.metadata_dir = new_metadata_dir;
+    new_input.datastore_dir = new_datastore.path().to_path_buf();
+    let context = VerificationContext {
+        product: "registry-relay".to_string(),
+        instance_id: "relay-a".to_string(),
+        environment: "production".to_string(),
+    };
+
+    let old_verified = TufConfigVerifier::verify_config_target(&old_input, &context)
+        .await
+        .expect("target verifies under old final root");
+    let new_verified = TufConfigVerifier::verify_config_target(&new_input, &context)
+        .await
+        .expect("same target verifies under new final root");
+
+    assert_eq!(old_verified.tuf.root_version, 1);
+    assert_eq!(new_verified.tuf.root_version, 2);
+    assert_ne!(old_verified.tuf.root_sha256, new_verified.tuf.root_sha256);
+    assert_eq!(old_verified.tuf.target_bytes, new_verified.tuf.target_bytes);
+    assert_eq!(old_verified.metadata, new_verified.metadata);
+    assert_eq!(old_verified.tuf.signer_kids, new_verified.tuf.signer_kids);
+
+    let accepted_roots = RegistryAcceptedTrustRoots {
+        accepted_roots: vec![
+            trust_root_for_verified_target(
+                "old-root",
+                old_verified.tuf.root_sha256.clone(),
+                &old_verified.tuf.signer_kids,
+            ),
+            trust_root_for_verified_target(
+                "new-root",
+                new_verified.tuf.root_sha256.clone(),
+                &new_verified.tuf.signer_kids,
+            ),
+        ],
+    };
+
+    let old_root = accepted_roots
+        .authorize(
+            &old_verified.metadata.change_classes,
+            &old_verified.tuf.signer_kids,
+            &old_verified.tuf.root_sha256,
+        )
+        .expect("old final root is accepted for root transition");
+    let new_root = accepted_roots
+        .authorize(
+            &new_verified.metadata.change_classes,
+            &new_verified.tuf.signer_kids,
+            &new_verified.tuf.root_sha256,
+        )
+        .expect("new final root is accepted for root transition");
+    assert_eq!(old_root.root_id, "old-root");
+    assert_eq!(new_root.root_id, "new-root");
 }
 
 #[tokio::test]
