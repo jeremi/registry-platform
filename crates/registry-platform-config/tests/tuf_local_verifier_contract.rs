@@ -1,14 +1,18 @@
 use std::path::{Path, PathBuf};
 
+use std::collections::HashMap;
+
 use chrono::{TimeDelta, Utc};
 use registry_platform_config::{
     sha256_uri, ConfigVerificationError, LocalTufRepositoryInput, TufConfigVerifier,
     VerificationContext,
 };
+use serde_json::{json, Value};
 use tempfile::TempDir;
 use tough::editor::signed::PathExists;
 use tough::editor::RepositoryEditor;
 use tough::key_source::{KeySource, LocalKeySource};
+use tough::schema::Target;
 
 const TUF_REFERENCE_TARGETS_SIGNER_KID: &str =
     "65171251a9aff5a8b3143a813481cb07f6e0de4eb197c767837fe4491b739093";
@@ -48,6 +52,16 @@ async fn generated_repository_input(
     target_name: &str,
     version: u64,
 ) -> LocalTufRepositoryInput {
+    generated_repository_input_with_custom(repo, datastore, target_name, version, None).await
+}
+
+async fn generated_repository_input_with_custom(
+    repo: &TempDir,
+    datastore: &TempDir,
+    target_name: &str,
+    version: u64,
+    custom: Option<Value>,
+) -> LocalTufRepositoryInput {
     let data = tough_fixture_dir("");
     let root_path = data.join("simple-rsa").join("root.json");
     let key_path = data.join("snakeoil.pem");
@@ -68,10 +82,20 @@ async fn generated_repository_input(
     editor.snapshot_version(version);
     editor.timestamp_expires(expiry);
     editor.timestamp_version(version);
-    editor
-        .add_target_paths(vec![target_path])
-        .await
-        .expect("target path");
+    if let Some(Value::Object(custom)) = custom {
+        let mut target = Target::from_path(&target_path)
+            .await
+            .expect("target metadata builds");
+        target.custom = custom.into_iter().collect::<HashMap<_, _>>();
+        editor
+            .add_target(target_name.to_string(), target)
+            .expect("target metadata with custom");
+    } else {
+        editor
+            .add_target_paths(vec![target_path])
+            .await
+            .expect("target path");
+    }
     let keys: Vec<Box<dyn KeySource>> = vec![Box::new(LocalKeySource { path: key_path })];
     let signed = editor.sign(&keys).await.expect("repository signs");
     signed.write(&metadata_dir).await.expect("metadata writes");
@@ -183,4 +207,44 @@ async fn config_target_verification_rejects_missing_registry_custom_metadata_aft
         error,
         ConfigVerificationError::InvalidTargetMetadata(_)
     ));
+}
+
+#[tokio::test]
+async fn config_target_verification_uses_tuf_signer_kids_over_custom_metadata_claims() {
+    let repo = TempDir::new().expect("repo tempdir");
+    let datastore = TempDir::new().expect("datastore tempdir");
+    let target_name = "file4.txt";
+    let target = std::fs::read(tough_fixture_dir("").join("targets").join(target_name))
+        .expect("target fixture reads");
+    let custom = json!({
+        "product": "registry-relay",
+        "instance_id": "relay-a",
+        "environment": "production",
+        "stream_id": "default",
+        "bundle_id": "bundle-43",
+        "sequence": 43,
+        "previous_config_hash": "sha256:old",
+        "config_hash": sha256_uri(&target),
+        "change_classes": ["public_metadata"],
+        "signer_kids": ["metadata-only-kid"],
+        "apply_policy": "restart_required"
+    });
+    let input =
+        generated_repository_input_with_custom(&repo, &datastore, target_name, 1, Some(custom))
+            .await;
+    let context = VerificationContext {
+        product: "registry-relay".to_string(),
+        instance_id: "relay-a".to_string(),
+        environment: "production".to_string(),
+    };
+
+    let verified = TufConfigVerifier::verify_config_target(&input, &context)
+        .await
+        .expect("valid registry custom metadata verifies");
+
+    assert_eq!(
+        verified.metadata.signer_kids,
+        verified.tuf.signer_kids.iter().cloned().collect()
+    );
+    assert!(!verified.metadata.signer_kids.contains("metadata-only-kid"));
 }

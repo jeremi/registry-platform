@@ -127,11 +127,12 @@ impl TufConfigVerifier {
         context: &VerificationContext,
     ) -> Result<VerifiedConfigTarget, ConfigVerificationError> {
         let tuf = Self::verify_local_target(input).await?;
-        let metadata = ConfigTargetMetadata::from_custom_metadata(
+        let mut metadata = ConfigTargetMetadata::from_custom_metadata(
             &tuf.custom_metadata,
             &tuf.target_bytes,
             context,
         )?;
+        metadata.signer_kids = tuf.signer_kids.iter().cloned().collect();
         Ok(VerifiedConfigTarget { tuf, metadata })
     }
 }
@@ -235,6 +236,12 @@ pub struct RegistryTrustRoot {
     pub high_risk_change_classes: BTreeSet<String>,
     pub signers: BTreeMap<String, TrustRootSigner>,
     pub roles: Vec<TrustRootRole>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RegistryAcceptedTrustRoots {
+    pub accepted_roots: Vec<RegistryTrustRoot>,
 }
 
 impl RegistryTrustRoot {
@@ -400,6 +407,58 @@ impl RegistryTrustRoot {
     }
 }
 
+impl RegistryAcceptedTrustRoots {
+    pub fn validate(&self) -> Result<(), ConfigVerificationError> {
+        if self.accepted_roots.is_empty() {
+            return Err(ConfigVerificationError::MissingAcceptedTrustRoots);
+        }
+        for root in &self.accepted_roots {
+            root.validate()?;
+        }
+        Ok(())
+    }
+
+    pub fn authorize(
+        &self,
+        change_classes: &BTreeSet<String>,
+        signer_kids: &[String],
+        tuf_root_sha256: &str,
+    ) -> Result<&RegistryTrustRoot, ConfigVerificationError> {
+        self.authorize_at(
+            change_classes,
+            signer_kids,
+            tuf_root_sha256,
+            current_unix_seconds()?,
+        )
+    }
+
+    pub fn authorize_at(
+        &self,
+        change_classes: &BTreeSet<String>,
+        signer_kids: &[String],
+        tuf_root_sha256: &str,
+        now_unix_seconds: u64,
+    ) -> Result<&RegistryTrustRoot, ConfigVerificationError> {
+        self.validate()?;
+        for root in &self.accepted_roots {
+            if root
+                .authorize_at(
+                    change_classes,
+                    signer_kids,
+                    tuf_root_sha256,
+                    now_unix_seconds,
+                )
+                .is_ok()
+            {
+                return Ok(root);
+            }
+        }
+        Err(ConfigVerificationError::NoAcceptedTrustRootAuthorized {
+            root_count: self.accepted_roots.len(),
+        })
+    }
+}
+
 #[derive(Debug, thiserror::Error, Eq, PartialEq)]
 pub enum ConfigVerificationError {
     #[error("{0} must not be empty")]
@@ -428,6 +487,8 @@ pub enum ConfigVerificationError {
     MissingChangeClasses,
     #[error("target metadata must list at least one signer kid")]
     MissingSigners,
+    #[error("accepted trust roots must list at least one root")]
+    MissingAcceptedTrustRoots,
     #[error("trust root must define at least one role")]
     MissingRoles,
     #[error("role '{role}' threshold must be at least 1")]
@@ -478,6 +539,8 @@ pub enum ConfigVerificationError {
     DisabledSigner { kid: String },
     #[error("no role authorized change class '{change_class}' for the supplied signers")]
     UnauthorizedChangeClass { change_class: String },
+    #[error("no accepted trust root authorized the verified target")]
+    NoAcceptedTrustRootAuthorized { root_count: usize },
 }
 
 pub fn sha256_uri(bytes: &[u8]) -> String {

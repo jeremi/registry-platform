@@ -3,7 +3,8 @@ use std::path::PathBuf;
 
 use registry_platform_config::{
     sha256_uri, ConfigTargetMetadata, ConfigVerificationError, LocalTufRepositoryInput,
-    RegistryTrustRoot, TrustRootRole, TrustRootSigner, VerificationContext,
+    RegistryAcceptedTrustRoots, RegistryTrustRoot, TrustRootRole, TrustRootSigner,
+    VerificationContext,
 };
 use serde_json::json;
 
@@ -356,5 +357,56 @@ fn registry_authorization_accepts_locally_bounded_rotated_root_overlap() {
             valid_until_unix_seconds: 1_800_000_000,
             now_unix_seconds: 1_800_000_000,
         }
+    );
+}
+
+#[test]
+fn accepted_trust_roots_authorize_against_the_matching_current_root() {
+    let old_root = trust_root();
+    let mut new_root = trust_root();
+    new_root.root_id = "ops-root-v2".to_string();
+    new_root.tuf_root_sha256 = OTHER_ROOT_HASH.to_string();
+    new_root.valid_from_unix_seconds = Some(1_700_000_000);
+    new_root.valid_until_unix_seconds = Some(1_800_000_000);
+    let roots = RegistryAcceptedTrustRoots {
+        accepted_roots: vec![old_root, new_root],
+    };
+
+    let authorized = roots
+        .authorize_at(
+            &set(&["public_metadata"]),
+            &["kid-a".to_string(), "kid-b".to_string()],
+            OTHER_ROOT_HASH,
+            1_750_000_000,
+        )
+        .expect("new root authorizes during overlap");
+    assert_eq!(authorized.root_id, "ops-root-v2");
+}
+
+#[test]
+fn accepted_trust_roots_reject_empty_or_unmatched_root_sets() {
+    let empty = RegistryAcceptedTrustRoots {
+        accepted_roots: vec![],
+    };
+    assert_eq!(
+        empty
+            .validate()
+            .expect_err("accepted roots must be explicit"),
+        ConfigVerificationError::MissingAcceptedTrustRoots
+    );
+
+    let roots = RegistryAcceptedTrustRoots {
+        accepted_roots: vec![trust_root()],
+    };
+    assert_eq!(
+        roots
+            .authorize_at(
+                &set(&["public_metadata"]),
+                &["kid-a".to_string(), "kid-b".to_string()],
+                OTHER_ROOT_HASH,
+                1_750_000_000,
+            )
+            .expect_err("no local root accepts the verified final TUF root"),
+        ConfigVerificationError::NoAcceptedTrustRootAuthorized { root_count: 1 }
     );
 }
