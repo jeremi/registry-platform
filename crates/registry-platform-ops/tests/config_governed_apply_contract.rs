@@ -1,7 +1,7 @@
 use registry_platform_ops::{
     AntiRollbackKey, AntiRollbackProposal, AntiRollbackRecord, AntiRollbackStoreError,
     ApplyReportResult, BreakGlassApproval, BreakGlassRateLimit, FileAntiRollbackStore,
-    PostureApplyResult,
+    FileLocalApprovalStore, LocalApprovalStoreError, LocalOperatorApproval, PostureApplyResult,
 };
 
 fn key() -> AntiRollbackKey {
@@ -33,6 +33,7 @@ fn record(sequence: u64, config_hash: &str) -> AntiRollbackRecord {
         last_config_hash: config_hash.to_string(),
         root_version: Some(3),
         break_glass: Default::default(),
+        local_approvals: Default::default(),
     }
 }
 
@@ -44,6 +45,20 @@ fn approval(expires_at_unix_seconds: u64) -> BreakGlassApproval {
         emergency_change_class: "emergency_break_glass".to_string(),
         expires_at_unix_seconds,
         rate_limit_identity: "registry-relay/relay-a/production/national-config".to_string(),
+    }
+}
+
+fn local_approval(expires_at_unix_seconds: u64, config_hash: &str) -> LocalOperatorApproval {
+    LocalOperatorApproval {
+        approved_by: "security@example.test".to_string(),
+        reason: "rotate config trust roots".to_string(),
+        approval_reference: "ROOT-2026-Q2".to_string(),
+        change_class: "root_transition".to_string(),
+        config_hash: config_hash.to_string(),
+        previous_config_hash: Some(hash("current")),
+        expires_at_unix_seconds,
+        rate_limit_identity: "registry-relay/relay-a/production/root-transition".to_string(),
+        rate_limit: rate_limit(),
     }
 }
 
@@ -124,6 +139,8 @@ fn antirollback_rejects_non_monotonic_sequence() {
                 root_version: Some(3),
                 break_glass: None,
                 break_glass_rate_limit: None,
+                local_approval: None,
+                local_approval_rate_limit: None,
             },
         )
         .expect_err("same sequence is rollback");
@@ -149,6 +166,8 @@ fn antirollback_rejects_previous_hash_mismatch_without_break_glass() {
                 root_version: Some(3),
                 break_glass: None,
                 break_glass_rate_limit: None,
+                local_approval: None,
+                local_approval_rate_limit: None,
             },
         )
         .expect_err("previous hash mismatch is rejected");
@@ -174,6 +193,8 @@ fn antirollback_rejects_root_version_rollback() {
                 root_version: Some(2),
                 break_glass: None,
                 break_glass_rate_limit: None,
+                local_approval: None,
+                local_approval_rate_limit: None,
             },
         )
         .expect_err("root version rollback is rejected");
@@ -203,6 +224,8 @@ fn break_glass_requires_local_approval_record() {
                 root_version: Some(4),
                 break_glass: None,
                 break_glass_rate_limit: Some(rate_limit()),
+                local_approval: None,
+                local_approval_rate_limit: None,
             },
         )
         .expect_err("break-glass requires local approval policy");
@@ -232,6 +255,8 @@ fn break_glass_waives_previous_hash_only_with_valid_approval() {
                 root_version: Some(4),
                 break_glass: Some(approval(2_000)),
                 break_glass_rate_limit: Some(rate_limit()),
+                local_approval: None,
+                local_approval_rate_limit: None,
             },
             1_000,
         )
@@ -266,6 +291,8 @@ fn break_glass_never_waives_monotonic_sequence() {
                 root_version: Some(4),
                 break_glass: Some(approval(2_000)),
                 break_glass_rate_limit: Some(rate_limit()),
+                local_approval: None,
+                local_approval_rate_limit: None,
             },
             1_000,
         )
@@ -296,6 +323,8 @@ fn break_glass_rejects_expired_or_incomplete_approval() {
                 root_version: Some(4),
                 break_glass: Some(approval(999)),
                 break_glass_rate_limit: Some(rate_limit()),
+                local_approval: None,
+                local_approval_rate_limit: None,
             },
             1_000,
         )
@@ -314,6 +343,8 @@ fn break_glass_rejects_expired_or_incomplete_approval() {
                 root_version: Some(4),
                 break_glass: Some(incomplete),
                 break_glass_rate_limit: Some(rate_limit()),
+                local_approval: None,
+                local_approval_rate_limit: None,
             },
             1_000,
         )
@@ -347,6 +378,8 @@ fn break_glass_is_rate_limited_in_rolling_window() {
                 root_version: Some(4),
                 break_glass: Some(approval(2_000)),
                 break_glass_rate_limit: Some(rate_limit()),
+                local_approval: None,
+                local_approval_rate_limit: None,
             },
             1_000,
         )
@@ -362,6 +395,8 @@ fn break_glass_is_rate_limited_in_rolling_window() {
                 root_version: Some(4),
                 break_glass: Some(approval(2_100)),
                 break_glass_rate_limit: Some(rate_limit()),
+                local_approval: None,
+                local_approval_rate_limit: None,
             },
             1_100,
         )
@@ -378,9 +413,169 @@ fn break_glass_is_rate_limited_in_rolling_window() {
                 root_version: Some(4),
                 break_glass: Some(approval(6_000)),
                 break_glass_rate_limit: Some(rate_limit()),
+                local_approval: None,
+                local_approval_rate_limit: None,
             },
             5_000,
         )
         .expect("break-glass outside the rolling window is accepted");
     assert_eq!(accepted_after_window.last_sequence, 44);
+}
+
+#[test]
+fn local_operator_approval_store_loads_matching_unexpired_approval() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let approval_path = dir.path().join("config-approvals.json");
+    std::fs::write(
+        &approval_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "approvals": [
+                local_approval(2_000, &hash("next"))
+            ]
+        }))
+        .expect("approval file serializes"),
+    )
+    .expect("approval file writes");
+    let store = FileLocalApprovalStore::new(&approval_path);
+
+    let approval = store
+        .load_for_apply_at(
+            "ROOT-2026-Q2",
+            "root_transition",
+            &hash("next"),
+            Some(hash("current").as_str()),
+            1_000,
+        )
+        .expect("matching approval loads");
+
+    assert_eq!(approval.approval_reference, "ROOT-2026-Q2");
+    assert_eq!(approval.change_class, "root_transition");
+
+    assert_eq!(
+        store
+            .load_for_apply_at(
+                "ROOT-2026-Q2",
+                "root_transition",
+                &hash("other"),
+                Some(hash("current").as_str()),
+                1_000,
+            )
+            .expect_err("approval is bound to config hash"),
+        LocalApprovalStoreError::ApprovalNotFound
+    );
+    assert_eq!(
+        store
+            .load_for_apply_at(
+                "ROOT-2026-Q2",
+                "root_transition",
+                &hash("next"),
+                Some(hash("current").as_str()),
+                2_000,
+            )
+            .expect_err("expired approval is rejected"),
+        LocalApprovalStoreError::ApprovalExpired
+    );
+}
+
+#[test]
+fn antirollback_records_local_operator_approval_without_waiving_previous_hash() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = FileAntiRollbackStore::new(dir.path().join("config-antirollback.json"));
+    store
+        .initialize(record(42, &hash("current")))
+        .expect("initial state writes");
+
+    let accepted = store
+        .accept_at(
+            &key(),
+            AntiRollbackProposal {
+                sequence: 43,
+                previous_config_hash: Some(hash("current")),
+                config_hash: hash("next"),
+                root_version: Some(4),
+                break_glass: None,
+                break_glass_rate_limit: None,
+                local_approval: Some(local_approval(2_000, &hash("next"))),
+                local_approval_rate_limit: Some(local_approval(2_000, &hash("next")).rate_limit),
+            },
+            1_000,
+        )
+        .expect("local approval records root transition acceptance");
+
+    assert_eq!(accepted.last_sequence, 43);
+    assert_eq!(accepted.last_config_hash, hash("next"));
+    assert_eq!(accepted.local_approvals.accepted.len(), 1);
+    assert_eq!(
+        accepted.local_approvals.accepted[0].approval_reference,
+        "ROOT-2026-Q2"
+    );
+
+    let mut approval_for_wrong_previous_hash = local_approval(3_000, &hash("another"));
+    approval_for_wrong_previous_hash.previous_config_hash = Some(hash("wrong"));
+    let previous_hash_mismatch = store
+        .accept_at(
+            &key(),
+            AntiRollbackProposal {
+                sequence: 44,
+                previous_config_hash: Some(hash("wrong")),
+                config_hash: hash("another"),
+                root_version: Some(4),
+                break_glass: None,
+                break_glass_rate_limit: None,
+                local_approval: Some(approval_for_wrong_previous_hash),
+                local_approval_rate_limit: Some(rate_limit()),
+            },
+            1_100,
+        )
+        .expect_err("local approval does not waive previous hash mismatch");
+    assert_eq!(
+        previous_hash_mismatch,
+        AntiRollbackStoreError::PreviousConfigHashMismatch
+    );
+
+    let mut mismatched_rate_limit_approval = local_approval(3_000, &hash("another"));
+    mismatched_rate_limit_approval.previous_config_hash = Some(hash("next"));
+    let mismatched_rate_limit = store
+        .accept_at(
+            &key(),
+            AntiRollbackProposal {
+                sequence: 44,
+                previous_config_hash: Some(hash("next")),
+                config_hash: hash("another"),
+                root_version: Some(4),
+                break_glass: None,
+                break_glass_rate_limit: None,
+                local_approval: Some(mismatched_rate_limit_approval),
+                local_approval_rate_limit: Some(BreakGlassRateLimit {
+                    max_accepted: 2,
+                    window_seconds: 3600,
+                }),
+            },
+            1_100,
+        )
+        .expect_err("caller cannot replace the approval rate limit");
+    assert_eq!(
+        mismatched_rate_limit,
+        AntiRollbackStoreError::InvalidLocalApproval("rate_limit")
+    );
+
+    let mut second_approval = local_approval(3_000, &hash("another"));
+    second_approval.previous_config_hash = Some(hash("next"));
+    let limited = store
+        .accept_at(
+            &key(),
+            AntiRollbackProposal {
+                sequence: 44,
+                previous_config_hash: Some(hash("next")),
+                config_hash: hash("another"),
+                root_version: Some(4),
+                break_glass: None,
+                break_glass_rate_limit: None,
+                local_approval: Some(second_approval),
+                local_approval_rate_limit: Some(rate_limit()),
+            },
+            1_100,
+        )
+        .expect_err("second local approval in same window is rejected");
+    assert_eq!(limited, AntiRollbackStoreError::LocalApprovalRateLimited);
 }

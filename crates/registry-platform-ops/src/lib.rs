@@ -177,6 +177,8 @@ pub struct AntiRollbackRecord {
     pub root_version: Option<u64>,
     #[serde(default)]
     pub break_glass: BreakGlassState,
+    #[serde(default)]
+    pub local_approvals: LocalApprovalState,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -187,6 +189,8 @@ pub struct AntiRollbackProposal {
     pub root_version: Option<u64>,
     pub break_glass: Option<BreakGlassApproval>,
     pub break_glass_rate_limit: Option<BreakGlassRateLimit>,
+    pub local_approval: Option<LocalOperatorApproval>,
+    pub local_approval_rate_limit: Option<BreakGlassRateLimit>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
@@ -203,6 +207,37 @@ pub struct BreakGlassAcceptance {
     pub sequence: u64,
     pub config_hash: String,
     pub expires_at_unix_seconds: u64,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
+pub struct LocalApprovalState {
+    #[serde(default)]
+    pub accepted: Vec<LocalApprovalAcceptance>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct LocalApprovalAcceptance {
+    pub accepted_at_unix_seconds: u64,
+    pub approval_reference: String,
+    pub change_class: String,
+    pub rate_limit_identity: String,
+    pub sequence: u64,
+    pub config_hash: String,
+    pub expires_at_unix_seconds: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct LocalOperatorApproval {
+    pub approved_by: String,
+    pub reason: String,
+    pub approval_reference: String,
+    pub change_class: String,
+    pub config_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_config_hash: Option<String>,
+    pub expires_at_unix_seconds: u64,
+    pub rate_limit_identity: String,
+    pub rate_limit: BreakGlassRateLimit,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
@@ -232,6 +267,10 @@ pub enum AntiRollbackStoreError {
     BreakGlassApprovalExpired,
     BreakGlassRateLimitMissing,
     BreakGlassRateLimited,
+    LocalApprovalExpired,
+    LocalApprovalRateLimitMissing,
+    LocalApprovalRateLimited,
+    InvalidLocalApproval(&'static str),
     InvalidBreakGlassApproval(&'static str),
     InvalidBreakGlassRateLimit(&'static str),
     InvalidState(String),
@@ -253,6 +292,14 @@ impl Display for AntiRollbackStoreError {
                 write!(f, "break-glass rate limit policy is missing")
             }
             Self::BreakGlassRateLimited => write!(f, "break-glass rate limit exceeded"),
+            Self::LocalApprovalExpired => write!(f, "local approval is expired"),
+            Self::LocalApprovalRateLimitMissing => {
+                write!(f, "local approval rate limit policy is missing")
+            }
+            Self::LocalApprovalRateLimited => write!(f, "local approval rate limit exceeded"),
+            Self::InvalidLocalApproval(field) => {
+                write!(f, "local approval field is invalid: {field}")
+            }
             Self::InvalidBreakGlassApproval(field) => {
                 write!(f, "break-glass approval field is invalid: {field}")
             }
@@ -333,6 +380,7 @@ impl FileAntiRollbackStore {
             }
         }
         let mut break_glass = current.break_glass.clone();
+        let mut local_approvals = current.local_approvals.clone();
         let approved_break_glass = if let Some(approval) = &proposal.break_glass {
             let rate_limit = proposal
                 .break_glass_rate_limit
@@ -356,12 +404,35 @@ impl FileAntiRollbackStore {
         {
             return Err(AntiRollbackStoreError::PreviousConfigHashMismatch);
         }
+        if let Some(approval) = &proposal.local_approval {
+            let rate_limit = proposal
+                .local_approval_rate_limit
+                .ok_or(AntiRollbackStoreError::LocalApprovalRateLimitMissing)?;
+            validate_local_approval(
+                approval,
+                &proposal.config_hash,
+                proposal.previous_config_hash.as_deref(),
+                now_unix_seconds,
+            )?;
+            validate_break_glass_rate_limit(rate_limit)?;
+            if approval.rate_limit != rate_limit {
+                return Err(AntiRollbackStoreError::InvalidLocalApproval("rate_limit"));
+            }
+            enforce_local_approval_rate_limit(
+                &mut local_approvals,
+                approval,
+                rate_limit,
+                proposal.sequence,
+                now_unix_seconds,
+            )?;
+        }
         let accepted = AntiRollbackRecord {
             key: key.clone(),
             last_sequence: proposal.sequence,
             last_config_hash: proposal.config_hash,
             root_version: proposal.root_version.or(current.root_version),
             break_glass,
+            local_approvals,
         };
         accepted.validate()?;
         self.write_record(&accepted)?;
@@ -438,6 +509,18 @@ impl AntiRollbackRecord {
             )?;
             validate_hash(&accepted.config_hash)?;
         }
+        for accepted in &self.local_approvals.accepted {
+            validate_non_empty(
+                "local_approvals.approval_reference",
+                &accepted.approval_reference,
+            )?;
+            validate_non_empty("local_approvals.change_class", &accepted.change_class)?;
+            validate_non_empty(
+                "local_approvals.rate_limit_identity",
+                &accepted.rate_limit_identity,
+            )?;
+            validate_hash(&accepted.config_hash)?;
+        }
         Ok(())
     }
 }
@@ -453,6 +536,44 @@ fn validate_break_glass_approval(
     validate_approval_field("rate_limit_identity", &approval.rate_limit_identity)?;
     if approval.expires_at_unix_seconds <= now_unix_seconds {
         return Err(AntiRollbackStoreError::BreakGlassApprovalExpired);
+    }
+    Ok(())
+}
+
+fn validate_local_approval(
+    approval: &LocalOperatorApproval,
+    config_hash: &str,
+    previous_config_hash: Option<&str>,
+    now_unix_seconds: u64,
+) -> Result<(), AntiRollbackStoreError> {
+    validate_local_approval_field("approved_by", &approval.approved_by)?;
+    validate_local_approval_field("reason", &approval.reason)?;
+    validate_local_approval_field("approval_reference", &approval.approval_reference)?;
+    validate_local_approval_field("change_class", &approval.change_class)?;
+    validate_local_approval_field("rate_limit_identity", &approval.rate_limit_identity)?;
+    validate_hash(&approval.config_hash)?;
+    if approval.config_hash != config_hash {
+        return Err(AntiRollbackStoreError::InvalidLocalApproval("config_hash"));
+    }
+    if approval.previous_config_hash.as_deref() != previous_config_hash {
+        return Err(AntiRollbackStoreError::InvalidLocalApproval(
+            "previous_config_hash",
+        ));
+    }
+    validate_break_glass_rate_limit(approval.rate_limit)
+        .map_err(|_| AntiRollbackStoreError::InvalidLocalApproval("rate_limit"))?;
+    if approval.expires_at_unix_seconds <= now_unix_seconds {
+        return Err(AntiRollbackStoreError::LocalApprovalExpired);
+    }
+    Ok(())
+}
+
+fn validate_local_approval_field(
+    name: &'static str,
+    value: &str,
+) -> Result<(), AntiRollbackStoreError> {
+    if value.trim().is_empty() {
+        return Err(AntiRollbackStoreError::InvalidLocalApproval(name));
     }
     Ok(())
 }
@@ -477,6 +598,39 @@ fn validate_break_glass_rate_limit(
             "window_seconds",
         ));
     }
+    Ok(())
+}
+
+fn enforce_local_approval_rate_limit(
+    state: &mut LocalApprovalState,
+    approval: &LocalOperatorApproval,
+    rate_limit: BreakGlassRateLimit,
+    sequence: u64,
+    now_unix_seconds: u64,
+) -> Result<(), AntiRollbackStoreError> {
+    state.accepted.retain(|accepted| {
+        accepted
+            .accepted_at_unix_seconds
+            .saturating_add(rate_limit.window_seconds)
+            > now_unix_seconds
+    });
+    let in_window_for_identity = state
+        .accepted
+        .iter()
+        .filter(|accepted| accepted.rate_limit_identity == approval.rate_limit_identity)
+        .count();
+    if in_window_for_identity >= rate_limit.max_accepted as usize {
+        return Err(AntiRollbackStoreError::LocalApprovalRateLimited);
+    }
+    state.accepted.push(LocalApprovalAcceptance {
+        accepted_at_unix_seconds: now_unix_seconds,
+        approval_reference: approval.approval_reference.clone(),
+        change_class: approval.change_class.clone(),
+        rate_limit_identity: approval.rate_limit_identity.clone(),
+        sequence,
+        config_hash: approval.config_hash.clone(),
+        expires_at_unix_seconds: approval.expires_at_unix_seconds,
+    });
     Ok(())
 }
 
@@ -511,6 +665,116 @@ fn enforce_break_glass_rate_limit(
         expires_at_unix_seconds: approval.expires_at_unix_seconds,
     });
     Ok(())
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct LocalApprovalFile {
+    #[serde(default)]
+    pub approvals: Vec<LocalOperatorApproval>,
+}
+
+#[derive(Clone, Debug)]
+pub struct FileLocalApprovalStore {
+    path: PathBuf,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LocalApprovalStoreError {
+    MissingState,
+    ApprovalNotFound,
+    ApprovalExpired,
+    InvalidApproval(&'static str),
+    InvalidState(String),
+    Io(String),
+    Json(String),
+}
+
+impl Display for LocalApprovalStoreError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingState => write!(f, "local approval state is missing"),
+            Self::ApprovalNotFound => write!(f, "local approval was not found"),
+            Self::ApprovalExpired => write!(f, "local approval is expired"),
+            Self::InvalidApproval(field) => write!(f, "local approval field is invalid: {field}"),
+            Self::InvalidState(message) => write!(f, "invalid local approval state: {message}"),
+            Self::Io(message) => write!(f, "local approval state I/O error: {message}"),
+            Self::Json(message) => write!(f, "local approval state JSON error: {message}"),
+        }
+    }
+}
+
+impl std::error::Error for LocalApprovalStoreError {}
+
+impl FileLocalApprovalStore {
+    pub fn new(path: impl AsRef<Path>) -> Self {
+        Self {
+            path: path.as_ref().to_path_buf(),
+        }
+    }
+
+    pub fn load_for_apply(
+        &self,
+        approval_reference: &str,
+        change_class: &str,
+        config_hash: &str,
+        previous_config_hash: Option<&str>,
+    ) -> Result<LocalOperatorApproval, LocalApprovalStoreError> {
+        self.load_for_apply_at(
+            approval_reference,
+            change_class,
+            config_hash,
+            previous_config_hash,
+            current_unix_seconds()
+                .map_err(|error| LocalApprovalStoreError::Io(error.to_string()))?,
+        )
+    }
+
+    pub fn load_for_apply_at(
+        &self,
+        approval_reference: &str,
+        change_class: &str,
+        config_hash: &str,
+        previous_config_hash: Option<&str>,
+        now_unix_seconds: u64,
+    ) -> Result<LocalOperatorApproval, LocalApprovalStoreError> {
+        let bytes = match fs::read(&self.path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(LocalApprovalStoreError::MissingState);
+            }
+            Err(error) => return Err(LocalApprovalStoreError::Io(error.to_string())),
+        };
+        let state: LocalApprovalFile = serde_json::from_slice(&bytes)
+            .map_err(|error| LocalApprovalStoreError::Json(error.to_string()))?;
+        let approval = state
+            .approvals
+            .into_iter()
+            .find(|approval| {
+                approval.approval_reference == approval_reference
+                    && approval.change_class == change_class
+                    && approval.config_hash == config_hash
+                    && approval.previous_config_hash.as_deref() == previous_config_hash
+            })
+            .ok_or(LocalApprovalStoreError::ApprovalNotFound)?;
+        validate_local_approval(
+            &approval,
+            config_hash,
+            previous_config_hash,
+            now_unix_seconds,
+        )
+        .map_err(local_approval_store_error)?;
+        Ok(approval)
+    }
+}
+
+fn local_approval_store_error(error: AntiRollbackStoreError) -> LocalApprovalStoreError {
+    match error {
+        AntiRollbackStoreError::LocalApprovalExpired => LocalApprovalStoreError::ApprovalExpired,
+        AntiRollbackStoreError::InvalidLocalApproval(field) => {
+            LocalApprovalStoreError::InvalidApproval(field)
+        }
+        other => LocalApprovalStoreError::InvalidState(other.to_string()),
+    }
 }
 
 fn current_unix_seconds() -> Result<u64, AntiRollbackStoreError> {
