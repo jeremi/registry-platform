@@ -192,7 +192,7 @@ impl ProxyHeaderPolicy {
 /// and caller auth material unless explicitly allowed by the policy.
 #[must_use]
 pub fn filter_proxy_request_headers(headers: &HeaderMap, policy: &ProxyHeaderPolicy) -> HeaderMap {
-    let mut out = HeaderMap::new();
+    let mut out = HeaderMap::with_capacity(headers.len());
     let connection_tokens = connection_header_tokens(headers);
     for (name, value) in headers {
         if is_hop_by_hop(name)
@@ -218,7 +218,7 @@ pub fn filter_proxy_request_headers(headers: &HeaderMap, policy: &ProxyHeaderPol
 /// response's `Connection` header.
 #[must_use]
 pub fn filter_proxy_response_headers(headers: &HeaderMap) -> HeaderMap {
-    let mut out = HeaderMap::new();
+    let mut out = HeaderMap::with_capacity(headers.len());
     let connection_tokens = connection_header_tokens(headers);
     for (name, value) in headers {
         if !is_hop_by_hop(name) && !connection_tokens.iter().any(|token| token == name) {
@@ -235,6 +235,7 @@ fn is_hop_by_hop(name: &HeaderName) -> bool {
             | "keep-alive"
             | "proxy-authenticate"
             | "proxy-authorization"
+            | "proxy-connection"
             | "te"
             | "trailer"
             | "transfer-encoding"
@@ -865,6 +866,10 @@ mod tests {
             HeaderName::from_static("keep-alive"),
             "timeout=5".parse().unwrap(),
         );
+        headers.insert(
+            HeaderName::from_static("proxy-connection"),
+            "keep-alive".parse().unwrap(),
+        );
         headers.insert(header::TE, "trailers".parse().unwrap());
         headers.insert("x-hop-token", "strip-by-connection-token".parse().unwrap());
         headers.insert("x-service-private-id", "spoofed".parse().unwrap());
@@ -877,6 +882,7 @@ mod tests {
         assert!(!filtered.contains_key(header::COOKIE));
         assert!(!filtered.contains_key(header::CONNECTION));
         assert!(!filtered.contains_key("keep-alive"));
+        assert!(!filtered.contains_key("proxy-connection"));
         assert!(!filtered.contains_key(header::TE));
         assert!(!filtered.contains_key("x-hop-token"));
         assert!(!filtered.contains_key("x-service-private-id"));
@@ -917,6 +923,10 @@ mod tests {
             "Basic realm=\"upstream\"".parse().unwrap(),
         );
         headers.insert(
+            HeaderName::from_static("proxy-connection"),
+            "keep-alive".parse().unwrap(),
+        );
+        headers.insert(
             "x-upstream-hop",
             "strip-by-connection-token".parse().unwrap(),
         );
@@ -927,6 +937,7 @@ mod tests {
         assert!(!filtered.contains_key(header::CONNECTION));
         assert!(!filtered.contains_key("keep-alive"));
         assert!(!filtered.contains_key(header::PROXY_AUTHENTICATE));
+        assert!(!filtered.contains_key("proxy-connection"));
         assert!(!filtered.contains_key("x-upstream-hop"));
         assert_eq!(filtered["x-normal-response"], "forwarded");
     }
