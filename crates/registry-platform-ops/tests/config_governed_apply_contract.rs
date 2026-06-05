@@ -84,6 +84,14 @@ fn apply_report_result_projects_to_posture_vocabulary() {
         PostureApplyResult::Rejected
     );
     assert_eq!(
+        ApplyReportResult::RejectedLocalApproval.as_posture_result(),
+        PostureApplyResult::Rejected
+    );
+    assert_eq!(
+        ApplyReportResult::RejectedLocalApproval.as_str(),
+        "rejected_local_approval"
+    );
+    assert_eq!(
         ApplyReportResult::InternalError.as_posture_result(),
         PostureApplyResult::Failed
     );

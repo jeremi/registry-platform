@@ -106,6 +106,7 @@ pub enum ApplyReportResult {
     RejectedRestartRequired,
     RejectedReadiness,
     RejectedBreakGlass,
+    RejectedLocalApproval,
     InternalError,
 }
 
@@ -121,6 +122,7 @@ impl ApplyReportResult {
             Self::RejectedRestartRequired => "rejected_restart_required",
             Self::RejectedReadiness => "rejected_readiness",
             Self::RejectedBreakGlass => "rejected_break_glass",
+            Self::RejectedLocalApproval => "rejected_local_approval",
             Self::InternalError => "internal_error",
         }
     }
@@ -135,7 +137,8 @@ impl ApplyReportResult {
             | Self::RejectedRollback
             | Self::RejectedRestartRequired
             | Self::RejectedReadiness
-            | Self::RejectedBreakGlass => PostureApplyResult::Rejected,
+            | Self::RejectedBreakGlass
+            | Self::RejectedLocalApproval => PostureApplyResult::Rejected,
             Self::InternalError => PostureApplyResult::Failed,
         }
     }
