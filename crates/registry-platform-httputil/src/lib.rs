@@ -246,9 +246,29 @@ fn connection_header_tokens(headers: &HeaderMap) -> Vec<HeaderName> {
     headers
         .get_all(CONNECTION)
         .iter()
-        .flat_map(|value| value.to_str().unwrap_or("").split(','))
-        .filter_map(|token| HeaderName::from_bytes(token.trim().as_bytes()).ok())
+        .flat_map(connection_header_value_tokens)
         .collect()
+}
+
+fn connection_header_value_tokens(value: &http::HeaderValue) -> Vec<HeaderName> {
+    value
+        .as_bytes()
+        .split(|byte| *byte == b',')
+        .filter_map(|token| {
+            let token = trim_ascii_http_whitespace(token);
+            HeaderName::from_bytes(token).ok()
+        })
+        .collect()
+}
+
+fn trim_ascii_http_whitespace(mut bytes: &[u8]) -> &[u8] {
+    while matches!(bytes.first(), Some(b' ' | b'\t')) {
+        bytes = &bytes[1..];
+    }
+    while matches!(bytes.last(), Some(b' ' | b'\t')) {
+        bytes = &bytes[..bytes.len() - 1];
+    }
+    bytes
 }
 
 /// URL construction helpers.
@@ -729,7 +749,7 @@ mod tests {
     use super::*;
     use axum::{
         body::Body,
-        http::{header, StatusCode},
+        http::{header, HeaderValue, StatusCode},
         response::IntoResponse,
         routing::get,
         Router,
@@ -909,6 +929,22 @@ mod tests {
         assert!(!filtered.contains_key(header::PROXY_AUTHENTICATE));
         assert!(!filtered.contains_key("x-upstream-hop"));
         assert_eq!(filtered["x-normal-response"], "forwarded");
+    }
+
+    #[test]
+    fn proxy_request_policy_strips_valid_connection_tokens_from_malformed_value() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::CONNECTION,
+            HeaderValue::from_bytes(b"x-hop-token,\xff").unwrap(),
+        );
+        headers.insert("x-hop-token", "strip-by-connection-token".parse().unwrap());
+        headers.insert("x-normal", "forwarded".parse().unwrap());
+
+        let filtered = filter_proxy_request_headers(&headers, &ProxyHeaderPolicy::strict());
+
+        assert!(!filtered.contains_key("x-hop-token"));
+        assert_eq!(filtered["x-normal"], "forwarded");
     }
 
     #[test]
