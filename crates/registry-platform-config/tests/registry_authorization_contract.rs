@@ -217,7 +217,23 @@ fn registry_authorization_accepts_distinct_role_members_for_all_change_classes()
 }
 
 #[test]
-fn registry_authorization_rejects_unknown_disabled_wrong_or_duplicate_signers() {
+fn registry_authorization_ignores_unknown_signers_when_known_quorum_satisfied() {
+    let root = trust_root();
+
+    root.authorize(
+        &set(&["auth_scopes"]),
+        &[
+            "kid-a".to_string(),
+            "kid-z".to_string(),
+            "kid-b".to_string(),
+        ],
+        TRUSTED_ROOT_HASH,
+    )
+    .expect("unknown signers do not reject a target with known quorum");
+}
+
+#[test]
+fn registry_authorization_rejects_disabled_or_insufficient_signers() {
     let root = trust_root();
 
     assert_eq!(
@@ -226,9 +242,9 @@ fn registry_authorization_rejects_unknown_disabled_wrong_or_duplicate_signers() 
             &["kid-z".to_string()],
             TRUSTED_ROOT_HASH,
         )
-        .expect_err("unknown signer is rejected"),
-        ConfigVerificationError::UnknownSigner {
-            kid: "kid-z".to_string()
+        .expect_err("unknown signer does not satisfy quorum"),
+        ConfigVerificationError::UnauthorizedChangeClass {
+            change_class: "auth_scopes".to_string()
         }
     );
     assert_eq!(

@@ -577,13 +577,9 @@ impl RegistryTrustRoot {
             return Err(ConfigVerificationError::MissingChangeClasses);
         }
         for kid in signer_kids {
-            match self.signers.get(kid) {
-                Some(signer) if signer.enabled => {}
-                Some(_) => {
+            if let Some(signer) = self.signers.get(kid) {
+                if !signer.enabled {
                     return Err(ConfigVerificationError::DisabledSigner { kid: kid.clone() });
-                }
-                None => {
-                    return Err(ConfigVerificationError::UnknownSigner { kid: kid.clone() });
                 }
             }
         }
