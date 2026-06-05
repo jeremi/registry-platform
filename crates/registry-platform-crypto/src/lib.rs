@@ -218,6 +218,14 @@ pub trait SigningProvider: Send + Sync {
     fn key_id(&self) -> &str;
     /// Public verification JWK for this provider.
     fn public_jwk(&self) -> PublicJwk;
+    /// Current readiness of the signing backend.
+    ///
+    /// Local in-memory providers are ready once constructed. Providers backed by
+    /// watched files, HSMs, KMS, or other external systems should override this
+    /// when they can degrade after startup.
+    fn readiness(&self) -> KeyReadiness {
+        KeyReadiness::Ready
+    }
     /// Sign the exact bytes supplied by the caller.
     async fn sign(&self, payload: &[u8]) -> Result<Vec<u8>, SigningError>;
 }
@@ -1546,6 +1554,15 @@ mod tests {
             assert_eq!(decoded.as_str(), expected);
             assert_eq!(decoded.is_ready(), is_ready);
         }
+    }
+
+    #[test]
+    fn local_signing_provider_reports_ready_readiness() {
+        let signer = LocalJwkSigner::new(PrivateJwk::parse(RAW_JWK).expect("jwk parses"))
+            .expect("local signer builds");
+        let provider: &dyn SigningProvider = &signer;
+
+        assert_eq!(provider.readiness(), KeyReadiness::Ready);
     }
 
     #[test]
