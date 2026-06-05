@@ -143,7 +143,8 @@ impl TufConfigVerifier {
             })
             .ok_or_else(|| ConfigVerificationError::TargetNotFound(input.target_name.clone()))?;
         let root_version = repository.root().signed.version.into();
-        let root_sha256 = verified_local_root_sha256(input, &root, root_version).await?;
+        let root_sha256 =
+            verified_local_root_sha256(&input.metadata_dir, &root, root_version).await?;
         Ok(TufVerifiedTarget {
             target_name: input.target_name.clone(),
             target_bytes,
@@ -172,6 +173,7 @@ impl TufConfigVerifier {
         let transport = GuardedRemoteTransport::new(input.fetch_policy());
         transport.validate_base_url(&metadata_url)?;
         transport.validate_base_url(&targets_url)?;
+        let metadata_base_url = metadata_url.clone();
         let repository = RepositoryLoader::new(&root, metadata_url, targets_url)
             .transport(transport.clone())
             .expiration_enforcement(ExpirationEnforcement::Safe)
@@ -206,7 +208,7 @@ impl TufConfigVerifier {
             .ok_or_else(|| ConfigVerificationError::TargetNotFound(input.target_name.clone()))?;
         let root_version = repository.root().signed.version.into();
         let root_sha256 =
-            verified_remote_root_sha256(input, &transport, &root, root_version).await?;
+            verified_remote_root_sha256(metadata_base_url, &transport, &root, root_version).await?;
         Ok(TufVerifiedTarget {
             target_name: input.target_name.clone(),
             target_bytes,
@@ -549,6 +551,21 @@ impl RegistryTrustRoot {
         now_unix_seconds: u64,
     ) -> Result<(), ConfigVerificationError> {
         self.validate()?;
+        self.authorize_validated_at(
+            change_classes,
+            signer_kids,
+            tuf_root_sha256,
+            now_unix_seconds,
+        )
+    }
+
+    fn authorize_validated_at(
+        &self,
+        change_classes: &BTreeSet<String>,
+        signer_kids: &[String],
+        tuf_root_sha256: &str,
+        now_unix_seconds: u64,
+    ) -> Result<(), ConfigVerificationError> {
         if let Some(valid_from_unix_seconds) = self.valid_from_unix_seconds {
             if now_unix_seconds < valid_from_unix_seconds {
                 return Err(ConfigVerificationError::TrustRootNotYetValid {
@@ -639,7 +656,7 @@ impl RegistryAcceptedTrustRoots {
         self.validate()?;
         for root in &self.accepted_roots {
             if root
-                .authorize_at(
+                .authorize_validated_at(
                     change_classes,
                     signer_kids,
                     tuf_root_sha256,
@@ -802,7 +819,7 @@ fn current_unix_seconds() -> Result<u64, ConfigVerificationError> {
 }
 
 async fn verified_local_root_sha256(
-    input: &LocalTufRepositoryInput,
+    metadata_dir: &Path,
     bootstrap_root: &[u8],
     root_version: u64,
 ) -> Result<String, ConfigVerificationError> {
@@ -810,7 +827,7 @@ async fn verified_local_root_sha256(
     if root_version == bootstrap_version {
         return Ok(sha256_uri(bootstrap_root));
     }
-    let versioned_root_path = input.metadata_dir.join(format!("{root_version}.root.json"));
+    let versioned_root_path = metadata_dir.join(format!("{root_version}.root.json"));
     let final_root = tokio::fs::read(&versioned_root_path)
         .await
         .map_err(|error| ConfigVerificationError::Io(error.to_string()))?;
@@ -818,7 +835,7 @@ async fn verified_local_root_sha256(
 }
 
 async fn verified_remote_root_sha256(
-    input: &RemoteTufRepositoryInput,
+    metadata_base_url: Url,
     transport: &GuardedRemoteTransport,
     bootstrap_root: &[u8],
     root_version: u64,
@@ -827,7 +844,6 @@ async fn verified_remote_root_sha256(
     if root_version == bootstrap_version {
         return Ok(sha256_uri(bootstrap_root));
     }
-    let (metadata_base_url, _) = input.validate()?;
     let versioned_root_url = append_url_path_segment(
         metadata_base_url,
         &format!("{root_version}.root.json"),
@@ -908,7 +924,7 @@ mod tests {
             target_name: "unused".to_string(),
         };
 
-        let hash = verified_local_root_sha256(&input, &bootstrap_root, 2)
+        let hash = verified_local_root_sha256(&input.metadata_dir, &bootstrap_root, 2)
             .await
             .expect("root hash resolves");
 
@@ -929,7 +945,7 @@ mod tests {
             target_name: "unused".to_string(),
         };
 
-        let hash = verified_local_root_sha256(&input, &bootstrap_root, 1)
+        let hash = verified_local_root_sha256(&input.metadata_dir, &bootstrap_root, 1)
             .await
             .expect("root hash resolves");
 

@@ -895,13 +895,12 @@ fn sha256_hex(bytes: &[u8]) -> String {
     output
 }
 
-fn redact_config_secrets(
-    value: &Value,
-    path: &mut Vec<String>,
+fn redact_config_secrets<'a>(
+    value: &'a Value,
+    path: &mut Vec<&'a str>,
     classify: &impl Fn(&[&str], &Value) -> ConfigValueSensitivity,
 ) -> Value {
-    let borrowed_path = path.iter().map(String::as_str).collect::<Vec<_>>();
-    if classify(&borrowed_path, value) == ConfigValueSensitivity::Secret {
+    if classify(path, value) == ConfigValueSensitivity::Secret {
         return Value::String("[secret]".to_string());
     }
 
@@ -910,7 +909,7 @@ fn redact_config_secrets(
             items
                 .iter()
                 .map(|item| {
-                    path.push("*".to_string());
+                    path.push("*");
                     let redacted = redact_config_secrets(item, path, classify);
                     path.pop();
                     redacted
@@ -920,7 +919,7 @@ fn redact_config_secrets(
         Value::Object(map) => Value::Object(
             map.iter()
                 .map(|(key, child)| {
-                    path.push(key.clone());
+                    path.push(key);
                     let redacted = redact_config_secrets(child, path, classify);
                     path.pop();
                     (key.clone(), redacted)
