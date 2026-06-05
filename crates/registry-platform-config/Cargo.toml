@@ -8,6 +8,10 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+async-trait.workspace = true
+bytes.workspace = true
+futures-core.workspace = true
+registry-platform-httputil = { version = "0.1.2", path = "../registry-platform-httputil" }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -19,3 +23,4 @@ url.workspace = true
 [dev-dependencies]
 chrono.workspace = true
 tempfile.workspace = true
+wiremock.workspace = true

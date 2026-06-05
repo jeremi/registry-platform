@@ -2,13 +2,21 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use bytes::Bytes;
+use futures_core::Stream;
+use registry_platform_httputil::{read_bounded, FetchUrlPolicy};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tough::schema::{Root, Signed};
-use tough::{ExpirationEnforcement, FilesystemTransport, IntoVec, RepositoryLoader, TargetName};
+use tough::{
+    ExpirationEnforcement, FilesystemTransport, IntoVec, RepositoryLoader, TargetName, Transport,
+    TransportError, TransportErrorKind, TransportStream,
+};
 use url::Url;
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -35,6 +43,38 @@ impl LocalTufRepositoryInput {
         validate_non_empty_path("datastore_dir", &self.datastore_dir)?;
         validate_non_empty("target_name", &self.target_name)?;
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct RemoteTufRepositoryInput {
+    pub root_path: PathBuf,
+    pub metadata_base_url: String,
+    pub targets_base_url: String,
+    pub datastore_dir: PathBuf,
+    pub target_name: String,
+    pub allow_dev_insecure_fetch_urls: bool,
+}
+
+impl RemoteTufRepositoryInput {
+    pub fn validate(&self) -> Result<(Url, Url), ConfigVerificationError> {
+        validate_non_empty_path("root_path", &self.root_path)?;
+        validate_non_empty("metadata_base_url", &self.metadata_base_url)?;
+        validate_non_empty("targets_base_url", &self.targets_base_url)?;
+        validate_non_empty_path("datastore_dir", &self.datastore_dir)?;
+        validate_non_empty("target_name", &self.target_name)?;
+        let metadata_base_url =
+            parse_remote_base_url("metadata_base_url", &self.metadata_base_url)?;
+        let targets_base_url = parse_remote_base_url("targets_base_url", &self.targets_base_url)?;
+        Ok((metadata_base_url, targets_base_url))
+    }
+
+    fn fetch_policy(&self) -> FetchUrlPolicy {
+        if self.allow_dev_insecure_fetch_urls {
+            FetchUrlPolicy::dev()
+        } else {
+            FetchUrlPolicy::strict()
+        }
     }
 }
 
@@ -122,6 +162,69 @@ impl TufConfigVerifier {
         })
     }
 
+    pub async fn verify_remote_target(
+        input: &RemoteTufRepositoryInput,
+    ) -> Result<TufVerifiedTarget, ConfigVerificationError> {
+        let (metadata_url, targets_url) = input.validate()?;
+        let root = tokio::fs::read(&input.root_path)
+            .await
+            .map_err(|error| ConfigVerificationError::Io(error.to_string()))?;
+        let transport = GuardedRemoteTransport::new(input.fetch_policy());
+        transport.validate_base_url(&metadata_url)?;
+        transport.validate_base_url(&targets_url)?;
+        let repository = RepositoryLoader::new(&root, metadata_url, targets_url)
+            .transport(transport.clone())
+            .expiration_enforcement(ExpirationEnforcement::Safe)
+            .datastore(&input.datastore_dir)
+            .load()
+            .await
+            .map_err(|error| ConfigVerificationError::Tuf(error.to_string()))?;
+        let target_name = TargetName::new(&input.target_name)
+            .map_err(|error| ConfigVerificationError::InvalidTargetName(error.to_string()))?;
+        let mut stream = repository
+            .read_target(&target_name)
+            .await
+            .map_err(|error| ConfigVerificationError::Tuf(error.to_string()))?
+            .ok_or_else(|| ConfigVerificationError::TargetNotFound(input.target_name.clone()))?;
+        let target_bytes = IntoVec::into_vec(&mut stream)
+            .await
+            .map_err(|error| ConfigVerificationError::Tuf(error.to_string()))?;
+        let custom_metadata = repository
+            .targets()
+            .signed
+            .targets
+            .get(&target_name)
+            .map(|target| {
+                Value::Object(
+                    target
+                        .custom
+                        .iter()
+                        .map(|(key, value)| (key.clone(), value.clone()))
+                        .collect(),
+                )
+            })
+            .ok_or_else(|| ConfigVerificationError::TargetNotFound(input.target_name.clone()))?;
+        let root_version = repository.root().signed.version.into();
+        let root_sha256 =
+            verified_remote_root_sha256(input, &transport, &root, root_version).await?;
+        Ok(TufVerifiedTarget {
+            target_name: input.target_name.clone(),
+            target_bytes,
+            custom_metadata,
+            root_sha256,
+            signer_kids: repository
+                .targets()
+                .signatures
+                .iter()
+                .map(|signature| hex_lower(&signature.keyid))
+                .collect(),
+            root_version,
+            targets_version: repository.targets().signed.version.into(),
+            snapshot_version: repository.snapshot().signed.version.into(),
+            timestamp_version: repository.timestamp().signed.version.into(),
+        })
+    }
+
     pub async fn verify_config_target(
         input: &LocalTufRepositoryInput,
         context: &VerificationContext,
@@ -134,6 +237,104 @@ impl TufConfigVerifier {
         )?;
         metadata.signer_kids = tuf.signer_kids.iter().cloned().collect();
         Ok(VerifiedConfigTarget { tuf, metadata })
+    }
+
+    pub async fn verify_remote_config_target(
+        input: &RemoteTufRepositoryInput,
+        context: &VerificationContext,
+    ) -> Result<VerifiedConfigTarget, ConfigVerificationError> {
+        let tuf = Self::verify_remote_target(input).await?;
+        let mut metadata = ConfigTargetMetadata::from_custom_metadata(
+            &tuf.custom_metadata,
+            &tuf.target_bytes,
+            context,
+        )?;
+        metadata.signer_kids = tuf.signer_kids.iter().cloned().collect();
+        Ok(VerifiedConfigTarget { tuf, metadata })
+    }
+}
+
+#[derive(Clone, Debug)]
+struct GuardedRemoteTransport {
+    policy: FetchUrlPolicy,
+}
+
+impl GuardedRemoteTransport {
+    fn new(policy: FetchUrlPolicy) -> Self {
+        Self { policy }
+    }
+
+    fn validate_base_url(&self, url: &Url) -> Result<(), ConfigVerificationError> {
+        self.policy
+            .validate_for_immediate_fetch(url)
+            .map(|_| ())
+            .map_err(|error| ConfigVerificationError::UnsafeRemoteUrl(error.to_string()))
+    }
+
+    async fn fetch_bytes(&self, url: Url) -> Result<Bytes, TransportError> {
+        let validated = self
+            .policy
+            .validate_for_immediate_fetch_with_timeout(
+                &url,
+                registry_platform_httputil::DEFAULT_VALIDATED_FETCH_CONNECT_TIMEOUT,
+            )
+            .await
+            .map_err(|error| {
+                TransportError::new_with_cause(
+                    TransportErrorKind::UnsupportedUrlScheme,
+                    url.as_str(),
+                    error.to_string(),
+                )
+            })?;
+        let response = validated
+            .immediate_get()
+            .map_err(|error| {
+                TransportError::new_with_cause(
+                    TransportErrorKind::Other,
+                    url.as_str(),
+                    error.to_string(),
+                )
+            })?
+            .send()
+            .await
+            .map_err(|error| {
+                TransportError::new_with_cause(TransportErrorKind::Other, url.as_str(), error)
+            })?;
+        if matches!(response.status().as_u16(), 403 | 404 | 410) {
+            return Err(TransportError::new(
+                TransportErrorKind::FileNotFound,
+                url.as_str(),
+            ));
+        }
+        let response = response.error_for_status().map_err(|error| {
+            TransportError::new_with_cause(TransportErrorKind::Other, url.as_str(), error)
+        })?;
+        let body = read_bounded(response, 16 * 1024 * 1024)
+            .await
+            .map_err(|error| {
+                TransportError::new_with_cause(TransportErrorKind::Other, url.as_str(), error)
+            })?;
+        Ok(Bytes::from(body))
+    }
+}
+
+#[async_trait::async_trait]
+impl Transport for GuardedRemoteTransport {
+    async fn fetch(&self, url: Url) -> Result<TransportStream, TransportError> {
+        let bytes = self.fetch_bytes(url).await?;
+        Ok(Box::pin(SingleBytesStream { item: Some(bytes) }))
+    }
+}
+
+struct SingleBytesStream {
+    item: Option<Bytes>,
+}
+
+impl Stream for SingleBytesStream {
+    type Item = Result<Bytes, TransportError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Poll::Ready(self.item.take().map(Ok))
     }
 }
 
@@ -473,6 +674,8 @@ pub enum ConfigVerificationError {
     TargetNotFound(String),
     #[error("local repository path could not be converted to a file URL")]
     InvalidRepositoryUrl,
+    #[error("remote repository URL is not allowed: {0}")]
+    UnsafeRemoteUrl(String),
     #[error("TUF verification failed: {0}")]
     Tuf(String),
     #[error("I/O error: {0}")]
@@ -579,6 +782,22 @@ fn dir_url(path: &Path) -> Result<Url, ConfigVerificationError> {
     Url::from_directory_path(path).map_err(|()| ConfigVerificationError::InvalidRepositoryUrl)
 }
 
+fn parse_remote_base_url(field: &'static str, value: &str) -> Result<Url, ConfigVerificationError> {
+    let url = Url::parse(value)
+        .map_err(|error| ConfigVerificationError::UnsafeRemoteUrl(error.to_string()))?;
+    if !matches!(url.scheme(), "https" | "http") {
+        return Err(ConfigVerificationError::UnsafeRemoteUrl(format!(
+            "{field} must use http or https"
+        )));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(ConfigVerificationError::UnsafeRemoteUrl(format!(
+            "{field} must not include userinfo"
+        )));
+    }
+    Ok(url)
+}
+
 fn current_unix_seconds() -> Result<u64, ConfigVerificationError> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -602,10 +821,49 @@ async fn verified_local_root_sha256(
     Ok(sha256_uri(&final_root))
 }
 
+async fn verified_remote_root_sha256(
+    input: &RemoteTufRepositoryInput,
+    transport: &GuardedRemoteTransport,
+    bootstrap_root: &[u8],
+    root_version: u64,
+) -> Result<String, ConfigVerificationError> {
+    let bootstrap_version = bootstrap_root_version(bootstrap_root)?;
+    if root_version == bootstrap_version {
+        return Ok(sha256_uri(bootstrap_root));
+    }
+    let (metadata_base_url, _) = input.validate()?;
+    let versioned_root_url = append_url_path_segment(
+        metadata_base_url,
+        &format!("{root_version}.root.json"),
+        "metadata_base_url",
+    )?;
+    let final_root = transport
+        .fetch_bytes(versioned_root_url)
+        .await
+        .map_err(|error| ConfigVerificationError::Tuf(error.to_string()))?;
+    Ok(sha256_uri(&final_root))
+}
+
 fn bootstrap_root_version(bootstrap_root: &[u8]) -> Result<u64, ConfigVerificationError> {
     let root: Signed<Root> = serde_json::from_slice(bootstrap_root)
         .map_err(|error| ConfigVerificationError::Tuf(error.to_string()))?;
     Ok(root.signed.version.into())
+}
+
+fn append_url_path_segment(
+    mut base: Url,
+    segment: &str,
+    field: &'static str,
+) -> Result<Url, ConfigVerificationError> {
+    base.path_segments_mut()
+        .map_err(|_| {
+            ConfigVerificationError::UnsafeRemoteUrl(format!(
+                "{field} cannot be used as a base URL"
+            ))
+        })?
+        .pop_if_empty()
+        .push(segment);
+    Ok(base)
 }
 
 fn hex_lower(bytes: &[u8]) -> String {

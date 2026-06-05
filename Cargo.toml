@@ -34,6 +34,7 @@ bytes = { version = "1" }
 chrono = { version = "0.4" }
 ed25519-dalek = { version = "2", features = ["pkcs8", "rand_core"] }
 fs2 = { version = "0.4" }
+futures-core = { version = "0.3" }
 getrandom = { version = "0.4" }
 hmac = { version = "0.13" }
 http = { version = "1" }
