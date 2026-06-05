@@ -20,6 +20,7 @@ and integration-test fixtures.
 | [`registry-platform-audit`](crates/registry-platform-audit/README.md) | Tamper-evident audit envelopes, async sinks, JSONL verification, and redaction helpers. |
 | [`registry-platform-authcommon`](crates/registry-platform-authcommon/README.md) | Provider-independent authentication helpers for Bearer tokens and API-key fingerprints. |
 | [`registry-platform-cache`](crates/registry-platform-cache/README.md) | Generic cache-store trait, redacted hashed keys, in-memory cache, and Redis backend for higher-level primitives. |
+| [`registry-platform-config`](crates/registry-platform-config/README.md) | Governed runtime configuration target metadata, trust-root, and per-change-class authorization contracts. |
 | [`registry-platform-crypto`](crates/registry-platform-crypto/README.md) | Ed25519 JWK parsing, provider-backed signing, verification, DID validation, and JSON canonicalization. |
 | [`registry-platform-httpsec`](crates/registry-platform-httpsec/README.md) | Axum/Tower HTTP security middleware, CORS policy validation, body limits, and RFC 9457 Problem Details responses. |
 | [`registry-platform-httputil`](crates/registry-platform-httputil/README.md) | Outbound HTTP clients, bounded response reads, URL construction, and SSRF-resistant fetch validation. |

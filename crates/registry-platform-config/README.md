@@ -1,0 +1,9 @@
+# registry-platform-config
+
+Shared contracts for governed runtime configuration delivery.
+
+This crate owns the Registry-specific layer that sits around the TUF client:
+target metadata parsing, product/instance/environment binding, per-change-class
+authorization, trust-root validation, and verifier input checks that prevent
+ephemeral rollback state. Product crates still parse and compile their own
+configuration after this layer accepts a target.
