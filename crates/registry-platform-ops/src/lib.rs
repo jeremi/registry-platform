@@ -321,13 +321,21 @@ impl std::error::Error for AntiRollbackStoreError {}
 #[derive(Clone, Debug)]
 pub struct FileAntiRollbackStore {
     path: PathBuf,
+    break_glass_rate_limit: Option<BreakGlassRateLimit>,
 }
 
 impl FileAntiRollbackStore {
     pub fn new(path: impl AsRef<Path>) -> Self {
         Self {
             path: path.as_ref().to_path_buf(),
+            break_glass_rate_limit: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_break_glass_rate_limit(mut self, rate_limit: BreakGlassRateLimit) -> Self {
+        self.break_glass_rate_limit = Some(rate_limit);
+        self
     }
 
     pub fn load(
@@ -385,9 +393,16 @@ impl FileAntiRollbackStore {
         let mut break_glass = current.break_glass.clone();
         let mut local_approvals = current.local_approvals.clone();
         let approved_break_glass = if let Some(approval) = &proposal.break_glass {
-            let rate_limit = proposal
-                .break_glass_rate_limit
-                .ok_or(AntiRollbackStoreError::BreakGlassRateLimitMissing)?;
+            let rate_limit = match (self.break_glass_rate_limit, proposal.break_glass_rate_limit) {
+                (Some(local), Some(proposed)) if local != proposed => {
+                    return Err(AntiRollbackStoreError::InvalidBreakGlassRateLimit(
+                        "policy_mismatch",
+                    ));
+                }
+                (Some(local), _) => local,
+                (None, Some(proposed)) => proposed,
+                (None, None) => return Err(AntiRollbackStoreError::BreakGlassRateLimitMissing),
+            };
             validate_break_glass_approval(approval, now_unix_seconds)?;
             validate_break_glass_rate_limit(rate_limit)?;
             enforce_break_glass_rate_limit(
@@ -443,13 +458,14 @@ impl FileAntiRollbackStore {
     }
 
     fn write_record(&self, record: &AntiRollbackRecord) -> Result<(), AntiRollbackStoreError> {
-        if let Some(parent) = self.path.parent() {
+        let target_path = self.write_target_path()?;
+        if let Some(parent) = target_path.parent() {
             fs::create_dir_all(parent)
                 .map_err(|error| AntiRollbackStoreError::Io(error.to_string()))?;
         }
         let bytes = serde_json::to_vec_pretty(record)
             .map_err(|error| AntiRollbackStoreError::Json(error.to_string()))?;
-        let tmp_path = self.path.with_extension("tmp");
+        let tmp_path = target_path.with_extension("tmp");
         {
             let mut file = fs::File::create(&tmp_path)
                 .map_err(|error| AntiRollbackStoreError::Io(error.to_string()))?;
@@ -460,9 +476,21 @@ impl FileAntiRollbackStore {
             file.sync_all()
                 .map_err(|error| AntiRollbackStoreError::Io(error.to_string()))?;
         }
-        fs::rename(&tmp_path, &self.path)
+        fs::rename(&tmp_path, &target_path)
             .map_err(|error| AntiRollbackStoreError::Io(error.to_string()))?;
         Ok(())
+    }
+
+    fn write_target_path(&self) -> Result<PathBuf, AntiRollbackStoreError> {
+        match fs::symlink_metadata(&self.path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => self
+                .path
+                .canonicalize()
+                .map_err(|error| AntiRollbackStoreError::Io(error.to_string())),
+            Ok(_) => Ok(self.path.clone()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(self.path.clone()),
+            Err(error) => Err(AntiRollbackStoreError::Io(error.to_string())),
+        }
     }
 
     fn acquire_lock(&self) -> Result<AntiRollbackStoreLock, AntiRollbackStoreError> {
@@ -831,8 +859,8 @@ pub fn posture_safe_config_hash(
     value: &Value,
     classify: impl Fn(&[&str], &Value) -> ConfigValueSensitivity,
 ) -> String {
-    let mut path = Vec::new();
-    let redacted = redact_config_secrets(value, &mut path, &classify);
+    let mut path = [""; CONFIG_REDACTION_PATH_STACK_LIMIT];
+    let redacted = redact_config_secrets(value, &mut path, 0, &classify);
     let bytes = canonicalize_json(&redacted).expect("serde_json::Value canonicalizes");
     sha256_hex(&bytes)
 }
@@ -885,6 +913,8 @@ const PUBLIC_RUNTIME_CONFIG_PATHS: &[&[&str]] = &[
     &["credential_status", "storage"],
 ];
 
+const CONFIG_REDACTION_PATH_STACK_LIMIT: usize = 64;
+
 fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     let mut output = String::with_capacity("sha256:".len() + 64);
@@ -896,6 +926,55 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 fn redact_config_secrets<'a>(
+    value: &'a Value,
+    path: &mut [&'a str],
+    depth: usize,
+    classify: &impl Fn(&[&str], &Value) -> ConfigValueSensitivity,
+) -> Value {
+    if classify(&path[..depth], value) == ConfigValueSensitivity::Secret {
+        return Value::String("[secret]".to_string());
+    }
+
+    match value {
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .map(|item| redact_config_secrets_child(item, path, depth, "*", classify))
+                .collect(),
+        ),
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(key, child)| {
+                    (
+                        key.clone(),
+                        redact_config_secrets_child(child, path, depth, key, classify),
+                    )
+                })
+                .collect(),
+        ),
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => value.clone(),
+    }
+}
+
+fn redact_config_secrets_child<'a>(
+    value: &'a Value,
+    path: &mut [&'a str],
+    depth: usize,
+    segment: &'a str,
+    classify: &impl Fn(&[&str], &Value) -> ConfigValueSensitivity,
+) -> Value {
+    if depth < path.len() {
+        path[depth] = segment;
+        redact_config_secrets(value, path, depth + 1, classify)
+    } else {
+        let mut overflow_path = Vec::with_capacity(path.len() + 1);
+        overflow_path.extend_from_slice(path);
+        overflow_path.push(segment);
+        redact_config_secrets_overflow(value, &mut overflow_path, classify)
+    }
+}
+
+fn redact_config_secrets_overflow<'a>(
     value: &'a Value,
     path: &mut Vec<&'a str>,
     classify: &impl Fn(&[&str], &Value) -> ConfigValueSensitivity,
@@ -910,7 +989,7 @@ fn redact_config_secrets<'a>(
                 .iter()
                 .map(|item| {
                     path.push("*");
-                    let redacted = redact_config_secrets(item, path, classify);
+                    let redacted = redact_config_secrets_overflow(item, path, classify);
                     path.pop();
                     redacted
                 })
@@ -920,7 +999,7 @@ fn redact_config_secrets<'a>(
             map.iter()
                 .map(|(key, child)| {
                     path.push(key);
-                    let redacted = redact_config_secrets(child, path, classify);
+                    let redacted = redact_config_secrets_overflow(child, path, classify);
                     path.pop();
                     (key.clone(), redacted)
                 })

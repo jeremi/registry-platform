@@ -69,6 +69,13 @@ fn rate_limit() -> BreakGlassRateLimit {
     }
 }
 
+fn loose_rate_limit() -> BreakGlassRateLimit {
+    BreakGlassRateLimit {
+        max_accepted: 100,
+        window_seconds: 1,
+    }
+}
+
 #[test]
 fn apply_report_result_projects_to_posture_vocabulary() {
     assert_eq!(
@@ -125,6 +132,39 @@ fn antirollback_state_survives_new_store_instance() {
     let second = FileAntiRollbackStore::new(&path);
     assert_eq!(
         second.load(&key()).expect("state loads after restart"),
+        record(41, &hash("old"))
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn antirollback_atomic_write_preserves_symlink_target() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let target_dir = dir.path().join("target");
+    std::fs::create_dir(&target_dir).expect("target dir creates");
+    let target_path = target_dir.join("config-antirollback.json");
+    std::fs::write(&target_path, "{}").expect("target placeholder writes");
+    let link_path = dir.path().join("config-antirollback.json");
+    symlink(&target_path, &link_path).expect("state symlink creates");
+
+    let store = FileAntiRollbackStore::new(&link_path);
+    store
+        .initialize(record(41, &hash("old")))
+        .expect("initial state writes through symlink");
+
+    assert!(
+        std::fs::symlink_metadata(&link_path)
+            .expect("link metadata reads")
+            .file_type()
+            .is_symlink(),
+        "state path remains a symlink"
+    );
+    assert_eq!(
+        FileAntiRollbackStore::new(&target_path)
+            .load(&key())
+            .expect("target state loads"),
         record(41, &hash("old"))
     );
 }
@@ -278,6 +318,72 @@ fn break_glass_waives_previous_hash_only_with_valid_approval() {
     assert_eq!(
         accepted.break_glass.accepted[0].approval_reference,
         "INC-4242"
+    );
+}
+
+#[test]
+fn configured_break_glass_policy_does_not_require_proposal_policy() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = FileAntiRollbackStore::new(dir.path().join("config-antirollback.json"))
+        .with_break_glass_rate_limit(rate_limit());
+    store
+        .initialize(record(42, &hash("current")))
+        .expect("initial state writes");
+
+    let accepted = store
+        .accept_at(
+            &key(),
+            AntiRollbackProposal {
+                sequence: 43,
+                previous_config_hash: Some(hash("other")),
+                config_hash: hash("recovery"),
+                root_version: Some(4),
+                break_glass: Some(approval(2_000)),
+                break_glass_rate_limit: None,
+                local_approval: None,
+                local_approval_rate_limit: None,
+            },
+            1_000,
+        )
+        .expect("local store policy can authorize break-glass");
+
+    assert_eq!(accepted.last_sequence, 43);
+    assert_eq!(accepted.break_glass.accepted.len(), 1);
+}
+
+#[test]
+fn configured_break_glass_policy_rejects_client_policy_mismatch() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = FileAntiRollbackStore::new(dir.path().join("config-antirollback.json"))
+        .with_break_glass_rate_limit(rate_limit());
+    store
+        .initialize(record(42, &hash("current")))
+        .expect("initial state writes");
+
+    let err = store
+        .accept_at(
+            &key(),
+            AntiRollbackProposal {
+                sequence: 43,
+                previous_config_hash: Some(hash("other")),
+                config_hash: hash("recovery"),
+                root_version: Some(4),
+                break_glass: Some(approval(2_000)),
+                break_glass_rate_limit: Some(loose_rate_limit()),
+                local_approval: None,
+                local_approval_rate_limit: None,
+            },
+            1_000,
+        )
+        .expect_err("proposal cannot override local store policy");
+
+    assert_eq!(
+        err,
+        AntiRollbackStoreError::InvalidBreakGlassRateLimit("policy_mismatch")
+    );
+    assert_eq!(
+        store.load(&key()).expect("state did not advance"),
+        record(42, &hash("current"))
     );
 }
 

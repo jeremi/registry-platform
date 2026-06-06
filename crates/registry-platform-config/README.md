@@ -12,3 +12,6 @@ configuration after this layer accepts a target.
 authoritative signer set and projects those kids onto the returned target
 metadata. Local products should authorize against `RegistryAcceptedTrustRoots`
 when more than one local root is configured for a bounded rotation overlap.
+
+Operator and integration guidance for the governed configuration primitives is
+in [`docs/governed-configuration.md`](../../docs/governed-configuration.md).

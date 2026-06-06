@@ -9,8 +9,10 @@ publish = false
 
 [dependencies]
 async-trait.workspace = true
+aws-lc-rs = "1.17.0"
 bytes.workspace = true
 futures-core.workspace = true
+olpc-cjson = "0.1.4"
 registry-platform-httputil = { version = "0.1.2", path = "../registry-platform-httputil" }
 serde.workspace = true
 serde_json.workspace = true
@@ -21,7 +23,6 @@ tough.workspace = true
 url.workspace = true
 
 [dev-dependencies]
-aws-lc-rs = "1.17.0"
 chrono.workspace = true
 tempfile.workspace = true
 wiremock.workspace = true

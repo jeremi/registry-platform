@@ -6,13 +6,16 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use aws_lc_rs::signature::UnparsedPublicKey;
 use bytes::Bytes;
 use futures_core::Stream;
+use olpc_cjson::CanonicalFormatter;
 use registry_platform_httputil::{read_bounded, FetchUrlPolicy};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use tough::schema::{Root, Signed};
+use tough::schema::key::{EcdsaScheme, Ed25519Scheme, Key, RsaScheme};
+use tough::schema::{RoleType, Root, Signed, Targets};
 use tough::{
     ExpirationEnforcement, FilesystemTransport, IntoVec, RepositoryLoader, TargetName, Transport,
     TransportError, TransportErrorKind, TransportStream,
@@ -145,17 +148,14 @@ impl TufConfigVerifier {
         let root_version = repository.root().signed.version.into();
         let root_sha256 =
             verified_local_root_sha256(&input.metadata_dir, &root, root_version).await?;
+        let signer_kids =
+            verified_targets_signer_kids(&repository.root().signed, repository.targets())?;
         Ok(TufVerifiedTarget {
             target_name: input.target_name.clone(),
             target_bytes,
             custom_metadata,
             root_sha256,
-            signer_kids: repository
-                .targets()
-                .signatures
-                .iter()
-                .map(|signature| hex_lower(&signature.keyid))
-                .collect(),
+            signer_kids,
             root_version,
             targets_version: repository.targets().signed.version.into(),
             snapshot_version: repository.snapshot().signed.version.into(),
@@ -209,17 +209,14 @@ impl TufConfigVerifier {
         let root_version = repository.root().signed.version.into();
         let root_sha256 =
             verified_remote_root_sha256(metadata_base_url, &transport, &root, root_version).await?;
+        let signer_kids =
+            verified_targets_signer_kids(&repository.root().signed, repository.targets())?;
         Ok(TufVerifiedTarget {
             target_name: input.target_name.clone(),
             target_bytes,
             custom_metadata,
             root_sha256,
-            signer_kids: repository
-                .targets()
-                .signatures
-                .iter()
-                .map(|signature| hex_lower(&signature.keyid))
-                .collect(),
+            signer_kids,
             root_version,
             targets_version: repository.targets().signed.version.into(),
             snapshot_version: repository.snapshot().signed.version.into(),
@@ -653,21 +650,25 @@ impl RegistryAcceptedTrustRoots {
         tuf_root_sha256: &str,
         now_unix_seconds: u64,
     ) -> Result<&RegistryTrustRoot, ConfigVerificationError> {
-        self.validate()?;
+        if self.accepted_roots.is_empty() {
+            return Err(ConfigVerificationError::MissingAcceptedTrustRoots);
+        }
+        let mut authorized = None;
         for root in &self.accepted_roots {
-            if root
+            root.validate()?;
+            let root_authorized = root
                 .authorize_validated_at(
                     change_classes,
                     signer_kids,
                     tuf_root_sha256,
                     now_unix_seconds,
                 )
-                .is_ok()
-            {
-                return Ok(root);
+                .is_ok();
+            if authorized.is_none() && root_authorized {
+                authorized = Some(root);
             }
         }
-        Err(ConfigVerificationError::NoAcceptedTrustRootAuthorized {
+        authorized.ok_or(ConfigVerificationError::NoAcceptedTrustRootAuthorized {
             root_count: self.accepted_roots.len(),
         })
     }
@@ -816,6 +817,93 @@ fn current_unix_seconds() -> Result<u64, ConfigVerificationError> {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .map_err(|error| ConfigVerificationError::Clock(error.to_string()))
+}
+
+fn verified_targets_signer_kids(
+    root: &Root,
+    targets: &Signed<Targets>,
+) -> Result<Vec<String>, ConfigVerificationError> {
+    let role_keys = root
+        .roles
+        .get(&RoleType::Targets)
+        .ok_or_else(|| ConfigVerificationError::Tuf("missing targets role".to_string()))?;
+    let signed_bytes = canonical_role_bytes(&targets.signed, "targets")?;
+    let mut seen = BTreeSet::new();
+    let mut signer_kids = Vec::new();
+
+    for signature in &targets.signatures {
+        if !role_keys.keyids.contains(&signature.keyid) {
+            continue;
+        }
+        let Some(key) = root.keys.get(&signature.keyid) else {
+            continue;
+        };
+        if verify_tuf_signature(key, &signed_bytes, signature.sig.as_ref()) {
+            let kid = hex_lower(&signature.keyid);
+            if seen.insert(kid.clone()) {
+                signer_kids.push(kid);
+            }
+        }
+    }
+
+    if signer_kids.len() as u64 >= role_keys.threshold.get() {
+        Ok(signer_kids)
+    } else {
+        Err(ConfigVerificationError::Tuf(format!(
+            "targets role verified but only {} verified signer kid(s) were recoverable for threshold {}",
+            signer_kids.len(),
+            role_keys.threshold
+        )))
+    }
+}
+
+fn canonical_role_bytes<T: Serialize>(
+    role: &T,
+    what: &'static str,
+) -> Result<Vec<u8>, ConfigVerificationError> {
+    let mut data = Vec::new();
+    let mut serializer =
+        serde_json::Serializer::with_formatter(&mut data, CanonicalFormatter::new());
+    role.serialize(&mut serializer).map_err(|error| {
+        ConfigVerificationError::Tuf(format!("{what} role canonicalization failed: {error}"))
+    })?;
+    Ok(data)
+}
+
+fn verify_tuf_signature(key: &Key, message: &[u8], signature: &[u8]) -> bool {
+    let (algorithm, public_key): (&dyn aws_lc_rs::signature::VerificationAlgorithm, &[u8]) =
+        match key {
+            Key::Ecdsa {
+                scheme: EcdsaScheme::EcdsaSha2Nistp256,
+                keyval,
+                ..
+            }
+            | Key::EcdsaOld {
+                scheme: EcdsaScheme::EcdsaSha2Nistp256,
+                keyval,
+                ..
+            } => (
+                &aws_lc_rs::signature::ECDSA_P256_SHA256_ASN1,
+                keyval.public.as_ref(),
+            ),
+            Key::Ed25519 {
+                scheme: Ed25519Scheme::Ed25519,
+                keyval,
+                ..
+            } => (&aws_lc_rs::signature::ED25519, keyval.public.as_ref()),
+            Key::Rsa {
+                scheme: RsaScheme::RsassaPssSha256,
+                keyval,
+                ..
+            } => (
+                &aws_lc_rs::signature::RSA_PSS_2048_8192_SHA256,
+                keyval.public.as_ref(),
+            ),
+        };
+
+    UnparsedPublicKey::new(algorithm, public_key)
+        .verify(message, signature)
+        .is_ok()
 }
 
 async fn verified_local_root_sha256(

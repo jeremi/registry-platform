@@ -2078,6 +2078,7 @@ dependencies = [
  "bytes",
  "chrono",
  "futures-core",
+ "olpc-cjson",
  "registry-platform-httputil",
  "serde",
  "serde_json",

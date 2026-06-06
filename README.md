@@ -116,6 +116,11 @@ This repository contains reusable primitives, not a complete application securit
 boundary. Consumers remain responsible for service authorization, tenant
 isolation, audit retention, secret provisioning, and deployment configuration.
 
+Governed runtime configuration integrations should follow the public
+[`governed-configuration`](docs/governed-configuration.md) guide for TUF
+verification, Registry trust roots, anti-rollback state, approval semantics, and
+apply result vocabulary.
+
 The in-memory cache and replay stores are for tests and single-process
 development. Services that require replay protection across restarts or
 active-active deployments need a durable shared backend such as Redis.
