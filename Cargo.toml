@@ -55,7 +55,7 @@ time = { version = "0.3", features = ["formatting"] }
 tokio = { version = "1", features = ["fs", "macros", "net", "rt-multi-thread", "sync", "time"] }
 tough = { version = "0.22.0" }
 tower = { version = "0.5" }
-tower-http = { version = "0.6", features = ["cors", "limit", "set-header"] }
+tower-http = { version = "0.7", features = ["cors", "limit", "set-header"] }
 ulid = { version = "1" }
 url = { version = "2" }
 wiremock = { version = "0.6" }
