@@ -527,9 +527,14 @@ pub struct TokenVerifierConfig {
     pub issuer: String,
     pub audiences: Vec<String>,
     pub allowed_algorithms: Vec<Algorithm>,
-    /// Allowed access-token `typ` header values. Empty denies all access-token
-    /// types.
+    /// Allowed access-token `typ` header values. Empty denies present
+    /// access-token types. Missing `typ` is accepted only when
+    /// `access_typ_required` is false.
     pub allowed_typ: Vec<String>,
+    /// Whether access tokens must carry a JOSE `typ` header. Keep this true for
+    /// typed access-token profiles. Set false only for issuers that omit `typ`
+    /// while still pinning issuer, audience, algorithm, and client.
+    pub access_typ_required: bool,
     /// Allowed ID-token `typ` header values. Empty means deny all ID tokens.
     pub allowed_id_typ: Vec<String>,
     /// Allowed UserInfo JWT `typ` header values. Empty means deny all UserInfo JWTs.
@@ -561,6 +566,7 @@ impl TokenVerifierConfig {
             audiences,
             allowed_algorithms,
             allowed_typ,
+            access_typ_required: true,
             allowed_id_typ: vec!["JWT".to_string(), "id_token".to_string()],
             allowed_userinfo_typ: vec!["JWT".to_string()],
             userinfo_requires_exp: true,
@@ -660,6 +666,12 @@ impl TokenVerifierConfig {
     }
 
     #[must_use]
+    pub fn with_access_token_typ_required(mut self, access_typ_required: bool) -> Self {
+        self.access_typ_required = access_typ_required;
+        self
+    }
+
+    #[must_use]
     pub fn with_userinfo_requires_exp(mut self, userinfo_requires_exp: bool) -> Self {
         self.userinfo_requires_exp = userinfo_requires_exp;
         self
@@ -747,7 +759,11 @@ impl TokenVerifier {
         if !self.config.allowed_algorithms.contains(&header.alg) {
             return Err(OidcError::AlgorithmNotAllowed);
         }
-        enforce_typ(header.typ.as_deref(), &self.allowed_access_typ)?;
+        enforce_access_typ(
+            header.typ.as_deref(),
+            &self.allowed_access_typ,
+            self.config.access_typ_required,
+        )?;
         let kid = header.kid.ok_or(OidcError::MissingKid)?;
         let key = self
             .fetcher
@@ -1058,6 +1074,25 @@ fn enforce_typ(typ: Option<&str>, allowed: &HashSet<String>) -> Result<(), OidcE
     }
 }
 
+/// Access-token `typ` is required by default. Some issuers, including eSignet,
+/// omit it on otherwise strongly constrained JWT access tokens. In that mode a
+/// missing `typ` is accepted, but a present `typ` still must be explicitly
+/// allowed.
+fn enforce_access_typ(
+    typ: Option<&str>,
+    allowed: &HashSet<String>,
+    required: bool,
+) -> Result<(), OidcError> {
+    if required {
+        return enforce_typ(typ, allowed);
+    }
+    match typ {
+        None => Ok(()),
+        Some(typ) if typ_in_allow_list(typ, allowed) => Ok(()),
+        Some(_) => Err(OidcError::TokenTypeNotAllowed),
+    }
+}
+
 /// Like [`enforce_typ`], but a MISSING `typ` header is accepted. The `typ`
 /// header is OPTIONAL for ID Tokens and signed UserInfo responses (OpenID
 /// Connect Core 1.0), and providers such as eSignet omit it. A present `typ`
@@ -1345,6 +1380,7 @@ mod tests {
                 audiences,
                 allowed_algorithms: vec![Algorithm::HS256],
                 allowed_typ: vec!["at+jwt".to_string()],
+                access_typ_required: true,
                 allowed_id_typ: vec!["JWT".to_string(), "id_token".to_string()],
                 allowed_userinfo_typ: vec!["JWT".to_string()],
                 userinfo_requires_exp,
@@ -1450,6 +1486,7 @@ mod tests {
                 audiences: vec!["registry-api".to_string()],
                 allowed_algorithms: vec![Algorithm::EdDSA],
                 allowed_typ: vec!["JWT".to_string()],
+                access_typ_required: true,
                 allowed_id_typ: vec!["JWT".to_string(), "id_token".to_string()],
                 allowed_userinfo_typ: vec!["JWT".to_string()],
                 userinfo_requires_exp: true,
@@ -1475,6 +1512,7 @@ mod tests {
                 audiences: vec!["aud".to_string()],
                 allowed_algorithms: vec![Algorithm::EdDSA],
                 allowed_typ: vec!["JWT".to_string()],
+                access_typ_required: true,
                 allowed_id_typ: vec!["JWT".to_string(), "id_token".to_string()],
                 allowed_userinfo_typ: vec!["JWT".to_string()],
                 userinfo_requires_exp: true,
@@ -1541,6 +1579,7 @@ mod tests {
                 audiences: vec!["aud".to_string()],
                 allowed_algorithms: vec![Algorithm::EdDSA],
                 allowed_typ: vec!["JWT".to_string()],
+                access_typ_required: true,
                 allowed_id_typ: vec!["JWT".to_string(), "id_token".to_string()],
                 allowed_userinfo_typ: vec!["JWT".to_string()],
                 userinfo_requires_exp: true,
@@ -1584,6 +1623,7 @@ mod tests {
                 audiences: vec!["registry-lab-api".to_string()],
                 allowed_algorithms: vec![Algorithm::EdDSA],
                 allowed_typ: vec!["JWT".to_string()],
+                access_typ_required: true,
                 allowed_id_typ: vec!["JWT".to_string(), "id_token".to_string()],
                 allowed_userinfo_typ: vec!["JWT".to_string()],
                 userinfo_requires_exp: true,
@@ -1630,6 +1670,7 @@ mod tests {
                 audiences: vec!["registry-lab-api".to_string()],
                 allowed_algorithms: vec![Algorithm::EdDSA],
                 allowed_typ: vec!["JWT".to_string()],
+                access_typ_required: true,
                 allowed_id_typ: vec!["JWT".to_string(), "id_token".to_string()],
                 allowed_userinfo_typ: vec!["JWT".to_string()],
                 userinfo_requires_exp: true,
@@ -1721,6 +1762,7 @@ mod tests {
                 audiences: vec!["registry-api".to_string()],
                 allowed_algorithms: vec![Algorithm::EdDSA],
                 allowed_typ: Vec::new(),
+                access_typ_required: true,
                 allowed_id_typ: vec!["JWT".to_string(), "id_token".to_string()],
                 allowed_userinfo_typ: vec!["JWT".to_string()],
                 userinfo_requires_exp: true,
@@ -1744,6 +1786,49 @@ mod tests {
         assert!(matches!(
             verifier.verify(&missing_typ).await,
             Err(OidcError::TokenTypeNotAllowed)
+        ));
+        assert!(matches!(
+            verifier.verify(&present_typ).await,
+            Err(OidcError::TokenTypeNotAllowed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn oidc_optional_access_typ_allows_missing_but_rejects_present_typ() {
+        let fetcher = Arc::new(JwksFetcher::new(
+            "http://127.0.0.1/jwks".to_string(),
+            JwksFetcherConfig::defaults(),
+        ));
+        let verifier = TokenVerifier::new(
+            TokenVerifierConfig {
+                issuer: "https://issuer.example".to_string(),
+                audiences: vec!["registry-api".to_string()],
+                allowed_algorithms: vec![Algorithm::EdDSA],
+                allowed_typ: Vec::new(),
+                access_typ_required: false,
+                allowed_id_typ: vec!["JWT".to_string(), "id_token".to_string()],
+                allowed_userinfo_typ: vec!["JWT".to_string()],
+                userinfo_requires_exp: true,
+                scope_claim: "scope".to_string(),
+                scope_separator: ' ',
+                scope_map: None,
+                allowed_clients: Vec::new(),
+                leeway: Duration::from_secs(60),
+            },
+            fetcher,
+        );
+        let missing_typ = unsigned_token(
+            json!({ "alg": "EdDSA" }),
+            json!({ "iss": "https://issuer.example", "aud": "registry-api", "exp": 4_102_444_800_i64 }),
+        );
+        let present_typ = unsigned_token(
+            json!({ "alg": "EdDSA", "typ": "JWT", "kid": "kid" }),
+            json!({ "iss": "https://issuer.example", "aud": "registry-api", "exp": 4_102_444_800_i64 }),
+        );
+
+        assert!(matches!(
+            verifier.verify(&missing_typ).await,
+            Err(OidcError::MissingKid)
         ));
         assert!(matches!(
             verifier.verify(&present_typ).await,
